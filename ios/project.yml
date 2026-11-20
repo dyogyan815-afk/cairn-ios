@@ -63,11 +63,16 @@ targets:
     platform: iOS
     sources:
       - path: Tests
+    dependencies:
+      - target: Cairn
     settings:
       base:
         # Prevents the test bundle from emitting Cairn.swiftmodule, which would
         # collide with the app target's module (root PRODUCT_NAME applies here).
         PRODUCT_MODULE_NAME: CairnTests
+        # Hosted tests: run inside the real app so @testable import Cairn works.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Cairn.app/Cairn"
+        BUNDLE_LOADER: "$(TEST_HOST)"
 schemes:
   Cairn:
     build:
