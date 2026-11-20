@@ -81,28 +81,29 @@ final class SchemeHandler: NSObject, WKURLSchemeHandler {
               h.lowercased().hasPrefix("bytes=") else { return nil }
         let spec = String(h.dropFirst("bytes=".count)).trimmingCharacters(in: .whitespaces)
         guard !spec.isEmpty else { return nil }
+        // Only the first range of a multi-range header is honoured.
         let first = spec.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
             .map { String($0).trimmingCharacters(in: .whitespaces) }
             .first ?? ""
-        let kv = first.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-            .map { String($0).trimmingCharacters(in: .whitespaces) }
-        if kv.count == 2 {
-            guard let s = Int64(kv[0]), let e = Int64(kv[1]) else { return nil }
-            guard s <= e, s >= 0, s < fileSize else { return nil }
-            return (s, min(e, fileSize - 1))
-        }
-        if kv.count == 1 {
-            let t = kv[0]
-            if t.isEmpty { return nil }
-            if t.hasPrefix("-") {
-                // suffix range: last N bytes
-                guard let n = Int64(t.dropFirst()), n > 0, fileSize > 0 else { return nil }
-                return (max(0, fileSize - n), fileSize - 1)
-            }
-            guard let s = Int64(t), s >= 0, s < fileSize else { return nil }
+        guard !first.isEmpty else { return nil }
+        // open-ended: bytes=N-
+        if first.hasSuffix("-") {
+            let startStr = String(first.dropLast()).trimmingCharacters(in: .whitespaces)
+            guard let s = Int64(startStr), s >= 0, s < fileSize else { return nil }
             return (s, fileSize - 1)
         }
-        return nil
+        // suffix: bytes=-N (last N bytes)
+        if first.hasPrefix("-") {
+            let t = String(first.dropFirst()).trimmingCharacters(in: .whitespaces)
+            guard let n = Int64(t), n > 0, fileSize > 0 else { return nil }
+            return (max(0, fileSize - n), fileSize - 1)
+        }
+        // closed: bytes=A-B
+        let kv = first.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        guard kv.count == 2, let s = Int64(kv[0]), let e = Int64(kv[1]) else { return nil }
+        guard s >= 0, s <= e, s < fileSize else { return nil }
+        return (s, min(e, fileSize - 1))
     }
 
     // MARK: - WKURLSchemeHandler

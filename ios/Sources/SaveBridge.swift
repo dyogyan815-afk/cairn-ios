@@ -33,6 +33,7 @@ final class ExportSession {
         let sanitized = name
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "..", with: "__")
             .replacingOccurrences(of: "\0", with: "_")
         let url = tmpDir.appendingPathComponent("\(UUID().uuidString)-\(sanitized)")
         FileManager.default.createFile(atPath: url.path, contents: nil)
