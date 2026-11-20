@@ -46,6 +46,23 @@ jobs:
       - name: Generate Xcode project
         working-directory: ios
         run: xcodegen generate
+      - name: Ensure an iPhone simulator exists
+        run: |
+          set -eo pipefail
+          python3 - <<'PY'
+          import json, subprocess
+          dt = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devicetypes", "-j"]))["devicetypes"]
+          phones = [d for d in dt if d["productFamily"] == "iPhone"]
+          dev_type = phones[-1]["identifier"]
+          rt = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "runtimes", "-j"]))["runtimes"]
+          ios_rt = [r for r in rt if r["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS")]
+          runtime = ios_rt[-1]["identifier"]
+          name = "CI-iPhone"
+          listed = subprocess.check_output(["xcrun", "simctl", "list", "devices"]).decode()
+          if name not in listed:
+              subprocess.check_call(["xcrun", "simctl", "create", name, dev_type, runtime])
+          print("simulator ready:", name, dev_type, runtime)
+          PY
       - name: Run unit tests on simulator
         working-directory: ios
         run: |
@@ -53,7 +70,7 @@ jobs:
           xcodebuild test \
             -project Cairn.xcodeproj \
             -scheme Cairn \
-            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -destination 'platform=iOS Simulator,name=CI-iPhone' \
             -derivedDataPath build
       - name: Build app for simulator
         working-directory: ios
@@ -64,19 +81,23 @@ jobs:
             -scheme Cairn \
             -configuration Debug \
             -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -destination 'platform=iOS Simulator,name=CI-iPhone' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
       - name: Launch smoke test
         run: |
           set -eo pipefail
-          SIM="iPhone 16"
+          SIM="CI-iPhone"
           xcrun simctl boot "$SIM" 2>/dev/null || true
           xcrun simctl bootstatus "$SIM" -b
           xcrun simctl install "$SIM" ios/build/Build/Products/Debug-iphonesimulator/Cairn.app
           xcrun simctl launch "$SIM" com.example.cairnipastudio
           sleep 8
-          xcrun simctl spawn "$SIM" launchctl list | grep -c "cairnipastudio" || (echo "PROCESS DIED" && exit 1)
+          if xcrun simctl spawn "$SIM" launchctl list | grep -q "cairnipastudio"; then
+            echo "APP ALIVE — smoke test passed"
+          else
+            echo "PROCESS DIED" && exit 1
+          fi
           xcrun simctl terminate "$SIM" com.example.cairnipastudio || true
 
   build-ipa:
