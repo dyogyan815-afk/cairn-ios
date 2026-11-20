@@ -10,7 +10,12 @@ enum BridgeJS {
       window.__cairnNativeInstalled = true;
       var mh = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cairnSave;
       if (!mh) return; // normal Safari: keep the existing download path
-      var CHUNK = 3 * 1024 * 1024; // 3 MB chunks (spec: 1-4 MB)
+      var CHUNK = 1024 * 1024; // 1 MB binary per message (~1.37 MB base64 body).
+      // Large bodies (3-4 MB) were silently dropped by WebKit on device: the
+      // 'begin'/'finish' messages arrived but every chunk was lost
+      // ("Size mismatch: got 0 of N"). So each chunk is now ACKNOWLEDGED by the
+      // native app before the next one is sent (flow control), and the chunk
+      // size is small enough to pass any per-message limit.
 
       function b64(buf) {
         var u = new Uint8Array(buf), s = '';
@@ -20,29 +25,63 @@ enum BridgeJS {
         return btoa(s);
       }
 
-      // Streams a Blob to the native app: begin -> chunk* -> finish | abort.
+      // Streams a Blob to the native app: begin -> (chunk -> ack)* -> finish | abort.
       // Returns true when the native path handled the export.
-      window.__cairnNativeSaver = async function (blob, name, onProgress) {
+      window.__cairnNativeSaver = async function (blob, name, onProgress, opts) {
+        var NAME = String(name);
         try {
           if (!(blob instanceof Blob)) return false;
           var total = blob.size;
-          var totalChunks = Math.max(1, Math.ceil(total / CHUNK));
-          mh.postMessage({ kind: 'begin', name: String(name), size: total, totalChunks: totalChunks });
-          var off = 0;
-          while (off < total) {
-            var end = Math.min(off + CHUNK, total);
-            var buf = await blob.slice(off, end).arrayBuffer();
-            mh.postMessage({ kind: 'chunk', index: Math.floor(off / CHUNK), data: b64(buf) });
-            off = end;
-            if (onProgress) { try { onProgress(off, total); } catch (e) {} }
+          var chunkBytes = (opts && opts.chunkBytes) || CHUNK;
+          var acked = -1, waiter = null;
+          var onAck = function (ev) {
+            var d = (ev && ev.detail) || {};
+            if (String(d.name) === NAME) {
+              acked = Math.max(acked, d.index | 0);
+              if (waiter) { var w = waiter; waiter = null; w(); }
+            }
+          };
+          window.addEventListener('cairnsaveack', onAck);
+          var waitAck = function (index) {
+            return new Promise(function (resolve) {
+              if (acked >= index) { resolve(true); return; }
+              waiter = resolve;
+              setTimeout(function () { if (waiter === resolve) { waiter = null; resolve(false); } }, 15000);
+            });
+          };
+          try {
+            mh.postMessage({ kind: 'begin', name: NAME, size: total });
+            var off = 0, idx = 0, lastPct = 0;
+            while (off < total) {
+              var end = Math.min(off + chunkBytes, total);
+              var buf = await blob.slice(off, end).arrayBuffer();
+              mh.postMessage({ kind: 'chunk', index: idx, data: b64(buf) });
+              var ok = await waitAck(idx);
+              if (!ok) throw new Error('the app did not confirm chunk ' + idx + ' — transfer stopped');
+              off = end; idx++;
+              if (onProgress) { try { onProgress(off, total); } catch (e) {} }
+              if (total > 0) {
+                var pct = Math.floor((off / total) * 100);
+                if (pct >= lastPct + 25) {
+                  lastPct += 25;
+                  try { window.dispatchEvent(new CustomEvent('cairnsaveprogress', { detail: { name: NAME, pct: Math.min(pct, 100) } })); } catch (e) {}
+                }
+              }
+            }
+            if (total === 0) {
+              mh.postMessage({ kind: 'chunk', index: 0, data: '' });
+              var ok0 = await waitAck(0);
+              if (!ok0) throw new Error('the app did not confirm the empty file');
+            }
+            mh.postMessage({ kind: 'finish', name: NAME });
+            return true;
+          } finally {
+            window.removeEventListener('cairnsaveack', onAck);
           }
-          if (total === 0) {
-            mh.postMessage({ kind: 'chunk', index: 0, data: '' });
-          }
-          mh.postMessage({ kind: 'finish', name: String(name) });
-          return true;
         } catch (e) {
-          try { mh.postMessage({ kind: 'abort', name: String(name), error: String(e && e.message || e) }); } catch (e2) {}
+          var msg = String(e && e.message || e);
+          try { window.dispatchEvent(new CustomEvent('cairnsavefail', { detail: { name: NAME, message: msg } })); } catch (e2) {}
+          try { mh.postMessage({ kind: 'abort', name: NAME, error: msg }); } catch (e3) {}
           return false;
         }
       };

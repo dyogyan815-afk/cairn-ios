@@ -126,6 +126,7 @@ final class SaveBridge: NSObject, WKScriptMessageHandler {
             if let chunk = body["data"] as? String {
                 do {
                     try session.append(base64: chunk)
+                    ackChunk(name: name, index: (body["index"] as? NSNumber)?.intValue ?? -1, received: session.received)
                 } catch {
                     sessions.removeValue(forKey: name)
                     session.abort()
@@ -163,6 +164,16 @@ final class SaveBridge: NSObject, WKScriptMessageHandler {
         guard let wv = webView else { return }
         DispatchQueue.main.async {
             UIActivityPresenter.present(url: url, from: wv)
+        }
+    }
+
+    /// Confirms a received chunk back to the page — the JS sender waits for this
+    /// ack before posting the next chunk (flow control; large unconfirmed bodies
+    /// were dropped by WebKit on device).
+    private func ackChunk(name: String, index: Int, received: Int64) {
+        let js = "window.dispatchEvent(new CustomEvent('cairnsaveack',{detail:{name:\(JS.quote(name)),index:\(index),received:\(received)}}))"
+        DispatchQueue.main.async { [weak self] in
+            self?.webView?.evaluateJavaScript(js, completionHandler: nil)
         }
     }
 
