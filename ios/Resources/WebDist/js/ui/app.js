@@ -1,0 +1,245 @@
+import { scanIPA, buildTree, readFileBytes } from '../core/ipa.js';
+import { DOWNLOADS, buildOriginalZip, buildProjectZip, buildResourcesZip, buildReportZip, buildManifest, manifestCsv, sha256sums, verifyExport, selectRecords, reportMarkdown } from '../core/exporter.js';
+import { CATEGORY_LABELS, TEXT_EXT, IMAGE_EXT, looksText, sniff } from '../core/classify.js';
+import { parsePlist, plistDocument } from '../core/plist.js';
+import { parseMachO, isMachO } from '../core/macho.js';
+import { cgbiToPng, isCgBI } from '../core/cgbi.js';
+import { formatBytes, toHex } from '../core/util.js';
+
+const $ = (s, r = document) => r.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const TABS = [['home', 'Home'], ['inspect', 'IPA Inspector'], ['explorer', 'File Explorer'], ['extract', 'Extraction'], ['downloads', 'ZIP Downloads'], ['security', 'Security Analysis'], ['settings', 'Settings']];
+const S = { tab: 'home', sessions: [], cur: null, busy: null, settings: load('cairn.settings', { history: false, deep: false }), history: load('cairn.history', []), urls: [] };
+function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }
+function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage may be blocked */ } }
+function toast(m) { const t = $('#toast'); t.textContent = m; t.classList.add('on'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('on'), 3200); }
+const cur = () => S.cur;
+
+// ---------- navigation ----------
+function renderNav() { $('#nav').innerHTML = TABS.map(([k, l]) => `<button data-t="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join(''); }
+$('#nav').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) go(b.dataset.t); });
+function go(t) { S.tab = t; renderNav(); closePreview(); render(); window.scrollTo(0, 0); }
+function renderSessionSel() {
+  const sel = $('#sessionSel'); sel.hidden = S.sessions.length < 2;
+  sel.innerHTML = S.sessions.map((s) => `<option value="${s.id}" ${s === S.cur ? 'selected' : ''}>${esc(s.file.name)}</option>`).join('');
+}
+$('#sessionSel').addEventListener('change', (e) => { S.cur = S.sessions.find((s) => String(s.id) === e.target.value); render(); });
+
+function render() {
+  const v = $('#view');
+  const needs = ['inspect', 'explorer', 'extract', 'downloads', 'security'].includes(S.tab);
+  if (needs && !cur()) { v.innerHTML = `<div class="card"><h2>No IPA open</h2><p class="note">Open an IPA from Home first.</p><button class="btn" data-go="home">Go to Home</button></div>`; return; }
+  ({ home: viewHome, inspect: viewInspect, explorer: viewExplorer, extract: viewExtract, downloads: viewDownloads, security: viewSecurity, settings: viewSettings })[S.tab](v);
+}
+document.addEventListener('click', (e) => { const g = e.target.closest('[data-go]'); if (g) go(g.dataset.go); });
+
+// ---------- home / upload ----------
+function viewHome(v) {
+  v.innerHTML = `
+  <div class="drop" id="drop"><h1>Open an IPA</h1><p>Drop an <b>.ipa</b> here, or choose it from the Files app / iCloud Drive. A <b>.zip</b> containing a <code>Payload/</code> folder works too.<br>Everything stays on this device.</p>
+  <label class="btn">Browse Files<input id="file" type="file" multiple hidden></label>
+  <p class="note">Your original file is only ever read, never changed. Very large IPAs depend on your device's memory; tested up to the sizes shown in the README.</p></div>
+  <div id="progress"></div>
+  ${S.sessions.length ? `<div class="card"><h3>Open sessions</h3>${S.sessions.map((s) => `<div class="row"><b>${esc(s.file.name)}</b><span class="note">${formatBytes(s.file.size)} · ${s.model.stats.files} files</span><button class="btn sm alt" data-open="${s.id}">Open</button><button class="btn sm alt" data-close="${s.id}">Close</button></div>`).join('')}</div>` : ''}
+  <div class="card"><h3>Recently inspected ${S.settings.history ? '' : '<span class="tag">off</span>'}</h3>${S.settings.history ? (S.history.length ? S.history.map((h) => `<div class="note">${esc(h.name)} · ${formatBytes(h.size)} · ${esc(h.app || '')} · ${new Date(h.at).toLocaleString()}</div>`).join('') + '<p class="note">Only names and dates are stored, on this device. Files are never stored.</p>' : '<p class="note">Nothing yet.</p>') : '<p class="note">History is off. Enable it in Settings if you want a local list of inspected files (names only).</p>'}</div>`;
+  const drop = $('#drop'); const pick = $('#file');
+  pick.onchange = () => { openFiles([...pick.files]); pick.value = ''; };
+  ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', (e) => openFiles([...e.dataTransfer.files]));
+  v.querySelectorAll('[data-open]').forEach((b) => (b.onclick = () => { S.cur = S.sessions.find((s) => String(s.id) === b.dataset.open); go('inspect'); }));
+  v.querySelectorAll('[data-close]').forEach((b) => (b.onclick = () => { S.sessions = S.sessions.filter((s) => String(s.id) !== b.dataset.close); if (S.cur && String(S.cur.id) === b.dataset.close) S.cur = S.sessions[0] || null; renderSessionSel(); render(); }));
+  if (S.busy) showProgress(S.busy.last);
+}
+function showProgress(p) {
+  const el = $('#progress'); if (!el || !S.busy) return;
+  const pct = p && p.total ? Math.min(100, (p.done / p.total) * 100) : 0;
+  el.innerHTML = `<div class="card"><h3>${esc(S.busy.label)}</h3><div class="bar"><i style="width:${pct}%"></i></div><p class="note">${p ? esc(p.current || '') : ''} ${p && p.files ? `(${p.files}/${p.totalFiles})` : ''}</p><button class="btn sm alt" id="cancel">Cancel</button></div>`;
+  $('#cancel').onclick = () => S.busy.ctl.abort();
+}
+async function openFiles(files) {
+  for (const file of files) {
+    if (!/\.(ipa|zip)$/i.test(file.name) && !confirm(`"${file.name}" doesn't end in .ipa or .zip. Try to open it as an archive anyway?`)) continue;
+    const ctl = new AbortController(); S.busy = { label: `Reading ${file.name}…`, ctl, last: null };
+    go('home');
+    try {
+      const model = await scanIPA(file, { signal: ctl.signal, onProgress: (p) => { S.busy.last = p; showProgress(p); } });
+      const s = { id: Date.now() + Math.random(), file, model, tree: buildTree(model.files), selected: new Set(), prefixes: new Set(), expanded: new Set(['Payload/']), q: '', sort: 'name', results: {} };
+      S.sessions.push(s); S.cur = s; renderSessionSel();
+      if (S.settings.history) { S.history = [{ name: file.name, size: file.size, app: model.app && model.app.bundleId, at: Date.now() }, ...S.history].slice(0, 20); save('cairn.history', S.history); }
+      S.busy = null; go('inspect'); toast(`Opened ${file.name}`);
+    } catch (e) {
+      S.busy = null; go('home');
+      $('#progress').innerHTML = `<div class="card"><h3 class="err">${e.code === 'aborted' ? 'Cancelled' : 'Could not open this file'}</h3><p>${esc(e.message)}</p><p class="note">You can pick another file or try again. Nothing was changed.</p></div>`;
+    }
+  }
+}
+
+if (typeof window !== 'undefined') window.__cairnOpenFiles = openFiles;
+
+// ---------- inspector ----------
+const dl = (o) => `<dl class="kv">${Object.entries(o).filter(([, v]) => v !== undefined && v !== '' && v !== null).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join('')}</dl>`;
+async function viewInspect(v) {
+  const m = cur().model, a = m.app, st = m.stats;
+  v.innerHTML = `<div class="card"><div class="row">${a ? `<img class="icon" id="appicon" alt="">` : ''}<div><h2 style="font-size:20px">${esc(a ? a.displayName : cur().file.name)}</h2><div class="note">${esc(a ? a.bundleId : 'No app bundle found')}</div></div></div>
+  <div class="grid" style="margin-top:10px"><div class="stat"><b>${st.files}</b><span>files</span></div><div class="stat"><b>${st.folders}</b><span>folders</span></div><div class="stat"><b>${formatBytes(st.bytes)}</b><span>extracted size</span></div><div class="stat"><b class="${st.problems ? 'err' : 'ok'}">${st.problems ? st.problems + ' flagged' : 'All OK'}</b><span>entry integrity (CRC)</span></div></div>
+  ${m.warnings.map((w) => `<p class="note">⚠ ${esc(w)}</p>`).join('')}</div>
+  ${a ? `<div class="card"><h3>Application</h3>${dl({ Name: esc(a.name), 'Display name': esc(a.displayName), 'Bundle ID': esc(a.bundleId), Version: esc(a.version), Build: esc(a.build), 'Minimum iOS': esc(a.minOS), Devices: esc(a.deviceFamilies.join(', ')), Executable: esc(a.executable) + (a.executableSize ? ` (${formatBytes(a.executableSize)})` : ''), Architectures: esc((a.architectures || []).join(', ') || 'not inspected'), 'URL schemes': esc(a.urlSchemes.join(', ') || 'none'), 'Info.plist': a.infoPlistFormat + ' format', SDK: esc(a.sdk), Xcode: esc(a.xcode) })}</div>
+  <div class="card"><h3>Privacy permissions (${a.permissions.length})</h3>${a.permissions.length ? `<table>${a.permissions.map((p) => `<tr><td>${esc(p.key)}</td><td>${esc(p.reason)}</td></tr>`).join('')}</table>` : '<span class="note">None declared.</span>'}</div>
+  <div class="card"><h3>Frameworks (${a.frameworks.length})</h3>${a.frameworks.map((f) => `<div>${esc(f.name)} <span class="note">${esc(f.bundleId || '')} ${esc(f.version || '')}</span></div>`).join('') || '<span class="note">None embedded.</span>'}</div>
+  <div class="card"><h3>App extensions (${a.extensions.length})</h3>${a.extensions.map((f) => `<div>${esc(f.name)} <span class="note">${esc(f.bundleId || '')} ${esc(f.extensionPoint || '')}</span></div>`).join('') || '<span class="note">None.</span>'}</div>
+  <div class="card"><h3>Signing</h3>${dl({ 'Code signature': a.codeSigned ? 'present' : 'not found', 'Signature identifier': esc(a.signatureIdentifier), 'Team (signature)': esc(a.teamIdFromSignature), Provisioning: a.provisioning ? esc(a.provisioning.error || `${a.provisioning.kind} · ${a.provisioning.name} · ${a.provisioning.teamName || ''}`) : 'no embedded profile', Expires: a.provisioning && esc(a.provisioning.expires) })}${a.entitlementsXml ? `<details><summary>Entitlements</summary><pre>${esc(a.entitlementsXml)}</pre></details>` : '<p class="note">No readable entitlements.</p>'}</div>` : ''}
+  <div class="card"><h3>Components</h3><table>${Object.entries(st.byCategory).map(([k, c]) => `<tr><td>${esc(CATEGORY_LABELS[k] || k)}</td><td>${c.files}</td><td>${formatBytes(c.bytes)}</td></tr>`).join('')}</table></div>
+  <div class="row"><button class="btn" data-go="explorer">Open File Explorer</button><button class="btn alt" data-go="downloads">Downloads</button></div>`;
+  if (a && a.icon) { try { const r = m.files.find((f) => f.path === a.icon); const { bytes } = await readFileBytes(cur().file, r, 8 << 20); const png = await cgbiToPng(bytes); const u = URL.createObjectURL(new Blob([png], { type: 'image/png' })); S.urls.push(u); const im = $('#appicon'); if (im) im.src = u; } catch { /* icon is optional */ } }
+}
+
+// ---------- explorer ----------
+function viewExplorer(v) {
+  const s = cur();
+  v.innerHTML = `<div class="card"><div class="row"><input type="search" id="q" placeholder="Search name or .ext" value="${esc(s.q)}" style="flex:1;min-width:150px"><select id="sort"><option value="name">Sort: name</option><option value="size">Sort: size</option><option value="type">Sort: type</option></select></div>
+  <div class="row" style="margin-top:8px"><span class="note" id="selinfo"></span><button class="btn sm alt" id="selall">Select all</button><button class="btn sm alt" id="selnone">Clear</button><button class="btn sm" id="dlsel">Download selected (ZIP)</button></div></div><div class="tree" id="tree"></div>`;
+  $('#sort').value = s.sort;
+  $('#q').oninput = (e) => { s.q = e.target.value; drawTree(); };
+  $('#sort').onchange = (e) => { s.sort = e.target.value; drawTree(); };
+  $('#selall').onclick = () => { s.prefixes = new Set(['']); drawTree(); }; $('#selnone').onclick = () => { s.selected.clear(); s.prefixes.clear(); drawTree(); };
+  $('#dlsel').onclick = () => exportJob('selected');
+  $('#tree').addEventListener('click', onTreeClick);
+  drawTree();
+}
+const sorter = (k) => (a, b) => (a.isDir !== b.isDir ? (a.isDir ? -1 : 1) : k === 'size' ? b.size - a.size : k === 'type' ? ((a.rec && a.rec.ext) || '').localeCompare((b.rec && b.rec.ext) || '') || a.name.localeCompare(b.name) : a.name.localeCompare(b.name, undefined, { numeric: true }));
+function isSel(s, n) { return s.selected.has(n.path) || [...s.prefixes].some((p) => n.path.startsWith(p)); }
+function drawTree() {
+  const s = cur(), rows = []; const q = s.q.trim().toLowerCase(); const LIM = 2500;
+  if (q) {
+    const ext = q.startsWith('.') ? q.slice(1) : null;
+    for (const f of s.model.files) { if (rows.length >= LIM) break; if (ext !== null ? f.ext === ext : f.path.toLowerCase().includes(q)) rows.push({ n: { path: f.path, name: f.path, isDir: f.isDir, size: f.size, rec: f }, d: 0 }); }
+  } else {
+    const walk = (n, d) => { for (const c of [...n.children.values()].sort(sorter(s.sort))) { if (rows.length >= LIM) return; rows.push({ n: c, d }); if (c.isDir && s.expanded.has(c.path)) walk(c, d + 1); } };
+    walk(s.tree, 0);
+  }
+  $('#tree').innerHTML = rows.map(({ n, d }) => `<div class="tr" style="padding-left:${8 + d * 16}px" data-p="${esc(n.path)}"><span class="tw" data-tw>${n.isDir ? (s.expanded.has(n.path) ? '▾' : '▸') : ''}</span><input type="checkbox" data-sel ${isSel(s, n) ? 'checked' : ''} aria-label="Select"><span class="nm" data-nm>${n.isDir ? '📁' : '📄'} ${esc(n.name)}${n.rec && n.rec.status !== 'ok' ? ' <span class="tag bad">' + esc(n.rec.status) + '</span>' : ''}${n.rec && n.rec.hidden ? ' <span class="tag">hidden</span>' : ''}</span><span class="sz">${n.isDir && !q ? n.count + ' files · ' : ''}${formatBytes(n.size)}</span></div>`).join('') + (rows.length >= LIM ? `<div class="tr note">Showing the first ${LIM} rows. Narrow the search or collapse folders to see more.</div>` : '') || '<div class="tr note">No matches.</div>';
+  const cnt = selectRecords(s.model, { paths: s.selected, prefixes: [...s.prefixes] }); $('#selinfo').textContent = (s.selected.size || s.prefixes.size) ? `${cnt.filter((x) => !x.isDir).length} files selected` : 'Nothing selected';
+}
+function onTreeClick(e) {
+  const s = cur(), row = e.target.closest('.tr'); if (!row || !row.dataset.p) return; const p = row.dataset.p; const isDir = p.endsWith('/');
+  if (e.target.matches('[data-sel]')) {
+    if (isDir) { e.target.checked ? s.prefixes.add(p) : s.prefixes.delete(p); } else { e.target.checked ? s.selected.add(p) : s.selected.delete(p); }
+    return drawTree();
+  }
+  if (e.target.closest('[data-tw]') || (isDir && e.target.closest('[data-nm]'))) { if (isDir) { s.expanded.has(p) ? s.expanded.delete(p) : s.expanded.add(p); drawTree(); } return; }
+  if (e.target.closest('[data-nm]') && !isDir) openPreview(s.model.files.find((f) => f.path === p));
+}
+
+// ---------- preview ----------
+function closePreview() { const p = $('#preview'); p.hidden = true; p.innerHTML = ''; S.urls.filter((u) => u.preview).forEach(URL.revokeObjectURL); }
+const hexDump = (u8, n = 512) => { let o = ''; for (let i = 0; i < Math.min(n, u8.length); i += 16) { const r = u8.subarray(i, i + 16); o += i.toString(16).padStart(8, '0') + '  ' + [...r].map((b) => b.toString(16).padStart(2, '0')).join(' ').padEnd(47) + '  ' + [...r].map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.')).join('') + '\n'; } return o; };
+async function openPreview(f) {
+  const P = $('#preview'); P.hidden = false; P.innerHTML = `<p>Loading…</p>`;
+  const head = `<div class="row"><b style="flex:1;word-break:break-all">${esc(f.path)}</b><button class="btn sm alt" id="pclose">Close</button></div><div class="row"><button class="btn sm alt" id="pcopy">Copy path</button><button class="btn sm" id="pdl">Download file</button></div>${dl({ Size: formatBytes(f.size) + ` (${f.size} bytes)`, Type: esc(f.mime || f.sig || 'unknown'), Signature: esc(f.sig), Category: esc(CATEGORY_LABELS[f.category]), 'SHA-256': `<code style="word-break:break-all">${esc(f.sha256)}</code>`, Status: f.status })}`;
+  let body = '';
+  try {
+    const LIMIT = 1 << 20; const { bytes, truncated } = await readFileBytes(cur().file, f, LIMIT); const sg = sniff(bytes); const ext = f.ext;
+    if (IMAGE_EXT.has(ext) && ext !== 'svg' && f.size < 30e6 || ['PNG image', 'JPEG image', 'GIF image', 'WebP image'].includes(sg.sig)) {
+      const full = (await readFileBytes(cur().file, f, 30e6)).bytes; const data = isCgBI(full) ? await cgbiToPng(full) : full;
+      const u = URL.createObjectURL(new Blob([data], { type: f.mime || 'image/png' })); S.urls.push(u); body = `<div class="prev"><img src="${u}" alt="preview"></div>${isCgBI(full) ? '<p class="note">Apple-optimised (CgBI) PNG, converted for display only. The original is unchanged.</p>' : ''}`;
+    } else if (ext === 'pdf' && f.size < 40e6) { const full = (await readFileBytes(cur().file, f, 40e6)).bytes; const u = URL.createObjectURL(new Blob([full], { type: 'application/pdf' })); body = `<a class="btn alt" href="${u}" target="_blank" rel="noopener">Open PDF</a>`; }
+    else if (['ttf', 'otf', 'woff', 'woff2'].includes(ext)) { const full = (await readFileBytes(cur().file, f, 10e6)).bytes; try { const ff = new FontFace('prev' + f.index, full.buffer.slice(full.byteOffset, full.byteOffset + full.byteLength)); await ff.load(); document.fonts.add(ff); body = `<p style="font:28px 'prev${f.index}'">The quick brown fox 0123456789</p>`; } catch { body = '<p class="note">This font could not be rendered by the browser.</p>'; } }
+    else if (sg.sig === 'Binary property list' || ext === 'plist' || ext === 'strings' && sg.sig === 'Binary property list') { const r = parsePlist((await readFileBytes(cur().file, f, 8 << 20)).bytes); body = `<p class="note">${r.format === 'binary' ? 'Binary plist, shown as XML. The file itself is not modified.' : 'XML plist'}</p><pre>${esc(plistDocument(r.value).slice(0, 200000))}</pre>`; }
+    else if (isMachO(bytes)) { const full = (await readFileBytes(cur().file, f, 160 << 20)).bytes; const m = parseMachO(full); body = `<p class="note">Compiled machine code. No source code is recoverable from this file.</p>` + m.slices.map((x) => !x.ok ? `<p class="err">${esc(x.error)}</p>` : `<h3>${esc(x.arch)} · ${esc(x.filetype)}${x.encrypted ? ' · <span class="err">FairPlay-encrypted</span>' : ''}</h3>${dl({ UUID: esc(x.uuid), Platform: esc(x.platform), 'Min OS': esc(x.minOS), PIE: x.pie ? 'yes' : 'no', 'Stack canary': x.signals.stackCanary === undefined ? 'unknown' : x.signals.stackCanary ? 'yes' : 'no', ARC: x.signals.arc === undefined ? 'unknown' : x.signals.arc ? 'yes' : 'no', 'Debug symbols': x.hasDebugSymbols ? 'DWARF segment present' : 'none', 'Linked libraries': esc(x.dylibs.map((d) => d.name).join('\n')).replace(/\n/g, '<br>'), 'Load commands': esc(Object.entries(x.cmdCounts).map(([k, n]) => k + '×' + n).join(', ')) })}`).join('') + `<h3>First bytes</h3><div class="hex">${esc(hexDump(bytes, 256))}</div>`; }
+    else if ((TEXT_EXT.has(ext) || looksText(bytes)) && sg.sig !== 'Binary property list') body = `${truncated ? '<p class="note">Showing the first 1 MB.</p>' : ''}<pre>${esc(new TextDecoder().decode(bytes))}</pre>`;
+    else body = `<p class="note">Binary file shown as raw bytes${f.category === 'ui' ? ' (compiled interface/asset data cannot be turned back into source)' : ''}. Nothing has been converted.</p><div class="hex">${esc(hexDump(bytes, 512))}</div>`;
+  } catch (e) { body = `<p class="err">Preview failed: ${esc(e.message)}</p>`; }
+  P.innerHTML = head + body;
+  $('#pclose').onclick = closePreview; $('#pcopy').onclick = () => { navigator.clipboard && navigator.clipboard.writeText(f.path).then(() => toast('Path copied'), () => toast('Copy not available')); };
+  $('#pdl').onclick = () => exportJob('selected', { paths: new Set([f.path]), single: true });
+}
+
+// ---------- extraction + downloads ----------
+function viewExtract(v) {
+  const s = cur(), st = s.model.stats;
+  v.innerHTML = `<div class="card"><h3>Extract everything</h3><p class="note">${st.files} files · ${st.folders} folders · ${formatBytes(st.bytes)}. Files are copied exactly as stored in the IPA — nothing is renamed, skipped or recompressed.</p>
+  <div class="row"><button class="btn" id="b-all">Extract all → ZIP</button><button class="btn alt" id="b-sel">Selected files/folders → ZIP</button><button class="btn alt" data-go="explorer">Select files…</button><a class="btn alt" id="b-orig" download="${esc(s.file.name)}">Original IPA</a></div></div><div id="job"></div>`;
+  $('#b-all').onclick = () => exportJob('original'); $('#b-sel').onclick = () => exportJob('selected');
+  const u = URL.createObjectURL(s.file); S.urls.push(u); $('#b-orig').href = u;
+}
+function viewDownloads(v) {
+  v.innerHTML = `<div class="card"><h3>Downloads</h3><p class="note">Every export is re-opened and checked against the archive (size + CRC${S.settings.deep ? ' + SHA-256' : ''}) before the download starts.</p>
+  <div class="grid">${[['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}">Build &amp; download</button></div>`).join('')}</div>
+  <div class="row" style="margin-top:10px"><button class="btn alt sm" data-x="manifest">manifest.json</button><button class="btn alt sm" data-x="csv">manifest.csv</button><button class="btn alt sm" data-x="sums">SHA256SUMS.txt</button><a class="btn alt sm" id="b-orig" download="${esc(cur().file.name)}">Original IPA (unmodified)</a></div></div><div id="job"></div>`;
+  v.querySelectorAll('[data-x]').forEach((b) => (b.onclick = () => exportJob(b.dataset.x)));
+  const u = URL.createObjectURL(cur().file); S.urls.push(u); $('#b-orig').href = u;
+}
+async function saveBlob(blob, name) {
+  if (typeof window !== 'undefined' && window.__cairnNativeSaver) {
+    let ok = false;
+    try { ok = await window.__cairnNativeSaver(blob, name); } catch (e) { ok = false; }
+    if (ok) return null;
+  }
+  const u = URL.createObjectURL(blob); S.urls.push(u); const a = document.createElement('a'); a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  return u;
+}
+async function exportJob(kind, opt = {}) {
+  const s = cur(); const jobEl = () => $('#job') || (() => { const d = document.createElement('div'); d.id = 'job'; $('#view').appendChild(d); return d; })();
+  const ctl = new AbortController(); const prog = (p) => { jobEl().innerHTML = `<div class="card"><h3>Building ${esc(kind)}…</h3><div class="bar"><i style="width:${p.total ? (p.done / p.total) * 100 : 5}%"></i></div><p class="note">${esc(p.current || '')}</p><button class="btn sm alt" id="jc">Cancel</button></div>`; $('#jc').onclick = () => ctl.abort(); };
+  prog({}); const o = { signal: ctl.signal, onProgress: prog };
+  try {
+    let res, name, expected = null;
+    if (kind === 'manifest' || kind === 'csv' || kind === 'sums') {
+      const m = buildManifest(s.model); const t = kind === 'manifest' ? [JSON.stringify(m, null, 2), 'manifest.json', 'application/json'] : kind === 'csv' ? [manifestCsv(m), 'manifest.csv', 'text/csv'] : [sha256sums(m), 'SHA256SUMS.txt', 'text/plain'];
+      await saveBlob(new Blob([t[0]], { type: t[2] }), t[1]); jobEl().innerHTML = `<div class="card ok">Saved ${t[1]} (${m.entries.length} entries).</div>`; return;
+    }
+    if (kind === 'original') { res = await buildOriginalZip(s.file, s.model, o); name = DOWNLOADS.original; expected = res.records; }
+    else if (kind === 'selected') {
+      const recs = selectRecords(s.model, { paths: opt.paths || s.selected, prefixes: opt.paths ? [] : [...s.prefixes] });
+      if (!recs.length) { jobEl().innerHTML = `<div class="card err">Nothing is selected. Pick files or folders in the File Explorer first.</div>`; return; }
+      if (opt.single && recs.length === 1) { const f = recs[0]; const { blob } = await (await import('../core/zip-reader.js')).entryToBlob(s.file, f.entry, { signal: ctl.signal }); await saveBlob(blob, f.name); jobEl().innerHTML = `<div class="card ok">Downloaded ${esc(f.name)}.</div>`; return; }
+      res = await buildOriginalZip(s.file, s.model, { ...o, records: recs }); name = 'SELECTED_FILES.zip'; expected = recs;
+    }
+    else if (kind === 'project') { res = await buildProjectZip(s.file, s.model, o); name = DOWNLOADS.project; }
+    else if (kind === 'resources') { res = await buildResourcesZip(s.file, s.model, o); name = DOWNLOADS.resources; }
+    else if (kind === 'report') { res = await buildReportZip(s.file, s.model, o); name = DOWNLOADS.report; }
+    let ver = null;
+    if (expected) ver = await verifyExport(res.blob, expected, { deep: S.settings.deep, signal: ctl.signal });
+    if (ver && !ver.ok) { jobEl().innerHTML = `<div class="card"><h3 class="err">Verification failed — download withheld</h3><p>Missing: ${ver.missing.length}, mismatched: ${ver.mismatched.length}</p></div>`; return; }
+    const u = await saveBlob(res.blob, name);
+    jobEl().innerHTML = `<div class="card"><h3 class="ok">${esc(name)} ready</h3><p>${res.count} entries · ${formatBytes(res.blob.size)}${ver ? ` · <span class="ok">verified ${ver.verified}/${ver.expected} entries${ver.deep ? ' (SHA-256)' : ' (size + CRC)'}</span>` : ''}</p>${res.skipped && res.skipped.length ? `<p class="err">${res.skipped.length} entries could not be copied: ${esc(res.skipped.map((x) => x.path).join(', '))}</p>` : ''}${u ? `<p class="note">If the save sheet didn't appear, tap:</p><a class="btn sm" href="${u}" download="${esc(name)}">Save ${esc(name)}</a>` : ''}</div>`;
+  } catch (e) { jobEl().innerHTML = `<div class="card"><h3 class="err">${e.code === 'aborted' ? 'Cancelled' : 'Export failed'}</h3><p>${esc(e.message)}</p><p class="note">${e.code === 'aborted' ? '' : 'This can happen when the device runs out of memory on a very large IPA. Try exporting selected folders instead.'}</p></div>`; }
+}
+
+// ---------- security ----------
+function viewSecurity(v) {
+  const m = cur().model, a = m.app, F = []; const add = (lvl, t, d) => F.push({ lvl, t, d });
+  const bad = m.files.filter((f) => f.status !== 'ok');
+  if (bad.length) add('bad', `${bad.length} archive entries failed integrity checks`, bad.slice(0, 5).map((f) => f.path + ' (' + f.status + ')').join(', '));
+  const unsafe = m.files.filter((f) => f.problems.includes('unsafe-path')); if (unsafe.length) add('bad', 'Unsafe paths in archive', 'Entries use absolute paths or "..". They are listed and preserved verbatim but never written to disk by this tool.');
+  if (m.files.some((f) => f.problems.includes('duplicate-name'))) add('warn', 'Duplicate entry names', 'Both copies are kept in the exports.');
+  if (a) {
+    if (a.encrypted) add('warn', 'Main executable is FairPlay-encrypted', 'Code is not readable until it is decrypted. This tool does not decrypt anything. Metadata, resources and all other files are still fully available.');
+    else if (a.macho && a.macho.ok) add('ok', 'Main executable is not encrypted', 'Mach-O headers, linked libraries and symbols are readable.');
+    const sl = a.macho && a.macho.ok ? a.macho.slices.filter((x) => x.ok) : [];
+    for (const x of sl) add(x.pie ? 'ok' : 'warn', `${x.arch}: PIE ${x.pie ? 'enabled' : 'not set'}`, ''), x.signals.stackCanary !== undefined && add(x.signals.stackCanary ? 'ok' : 'warn', `${x.arch}: stack canary ${x.signals.stackCanary ? 'indicators found' : 'indicators not found'}`, 'Heuristic from symbol names; not available if symbols are stripped.'), x.signals.arc !== undefined && add(x.signals.arc ? 'ok' : 'warn', `${x.arch}: ARC ${x.signals.arc ? 'indicators found' : 'indicators not found'}`, 'Heuristic.');
+    if (sl.some((x) => x.hasDebugSymbols)) add('warn', 'DWARF debug segment present', '');
+    if (!a.codeSigned) add('warn', 'No code signature found in the executable', '');
+    if (a.provisioning && a.provisioning.kind) add(a.provisioning.kind === 'App Store' ? 'ok' : 'warn', `Provisioning profile: ${a.provisioning.kind}`, `${a.provisioning.teamName || ''} ${a.provisioning.expires || ''}${a.provisioning.getTaskAllow ? ' · get-task-allow = true (debuggable)' : ''}`);
+    if (a.ats && (a.ats.NSAllowsArbitraryLoads === true)) add('warn', 'App Transport Security allows arbitrary loads', 'NSAllowsArbitraryLoads = true');
+    if (a.permissions.length) add('ok', `${a.permissions.length} privacy permission strings`, a.permissions.map((p) => p.key.replace(/^NS|UsageDescription$/g, '')).join(', '));
+    if (a.urlSchemes.length) add('ok', 'Custom URL schemes', a.urlSchemes.join(', '));
+    if (a.entitlements) add('ok', 'Entitlements', Object.keys(a.entitlements).join(', '));
+  } else add('warn', 'No app bundle', 'Not a standard IPA layout.');
+  v.innerHTML = `<div class="card"><h3>Security analysis</h3><p class="note">Static, local checks of metadata only. Not a malware scan and not a guarantee of safety.</p>${F.map((f) => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tag ${f.lvl}">${f.lvl === 'ok' ? 'info' : f.lvl === 'warn' ? 'note' : 'issue'}</span><b>${esc(f.t)}</b><div class="note">${esc(f.d)}</div></div>`).join('')}</div>`;
+}
+
+// ---------- settings ----------
+function viewSettings(v) {
+  v.innerHTML = `<div class="card"><h3>Privacy</h3><p class="ok">🔒 Everything runs in this page. This site makes no network requests with your files, has no analytics, and its Content-Security-Policy blocks outbound connections.</p></div>
+  <div class="card"><h3>Options</h3><label class="row"><input type="checkbox" id="s-hist" ${S.settings.history ? 'checked' : ''} style="width:22px;height:22px"> Keep a local list of inspected files (names only)</label>
+  <label class="row" style="margin-top:8px"><input type="checkbox" id="s-deep" ${S.settings.deep ? 'checked' : ''} style="width:22px;height:22px"> Deep-verify exports with SHA-256 (slower)</label>
+  <div class="row" style="margin-top:10px"><button class="btn alt sm" id="s-clear">Clear history</button></div></div>
+  <div class="card"><h3>About limits</h3><p class="note">Browsers limit memory. Exports reference the original file instead of copying it, which keeps memory low, but very large IPAs (multiple GB) may still fail on a phone. If so, export selected folders.</p></div>`;
+  $('#s-hist').onchange = (e) => { S.settings.history = e.target.checked; save('cairn.settings', S.settings); if (!e.target.checked) { S.history = []; save('cairn.history', []); } };
+  $('#s-deep').onchange = (e) => { S.settings.deep = e.target.checked; save('cairn.settings', S.settings); };
+  $('#s-clear').onclick = () => { S.history = []; save('cairn.history', []); toast('History cleared'); };
+}
+
+renderNav(); render();

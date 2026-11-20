@@ -1,0 +1,76 @@
+name: Cairn
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Bundle ID is defined in exactly ONE documented place: here.
+    # Change it here before re-signing with your own certificate.
+    PRODUCT_BUNDLE_IDENTIFIER: com.example.cairnipastudio
+    PRODUCT_NAME: Cairn
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_ALLOWED: "NO"
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+targets:
+  Cairn:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources/Assets.xcassets
+      # The built web app is copied into Resources/WebDist (by scripts/prepare-webdist.sh
+      # or by CI) and shipped as a folder reference so nested ES-module paths survive.
+      - path: Resources/WebDist
+        type: folder
+        buildPhase: resources
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: Cairn
+        CFBundleName: Cairn
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: iOS App Package
+            LSItemContentTypes: [com.apple.itunes.ipa]
+            CFBundleTypeRole: Viewer
+          - CFBundleTypeName: ZIP Archive
+            LSItemContentTypes: [public.zip-archive]
+            CFBundleTypeRole: Viewer
+        LSSupportsOpeningDocumentsInPlace: true
+        UIFileSharingEnabled: true
+        ITSAppUsesNonExemptEncryption: false
+        NSAppTransportSecurity: {}
+    settings:
+      base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"
+  CairnTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+schemes:
+  Cairn:
+    build:
+      targets:
+        Cairn: all
+    run:
+      config: Release
+    test:
+      config: Debug
+      targets:
+        - CairnTests

@@ -1,0 +1,13 @@
+{
+  "name": "cairn-ipa-studio",
+  "version": "1.0.0",
+  "description": "Cairn: a private, fully local, browser-based IPA inspector and extraction studio.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test --test-concurrency=1 tests/engine.test.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

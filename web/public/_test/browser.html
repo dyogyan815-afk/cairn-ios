@@ -1,0 +1,26 @@
+<!doctype html><meta charset="utf-8"><body><pre id="out">running</pre>
+<iframe id="f" src="../index.html" style="width:420px;height:800px"></iframe>
+<script type="module">
+const out = (o) => (document.getElementById('out').textContent = JSON.stringify(o, null, 1));
+const R = { steps: [] }; const ok = (n, v) => R.steps.push([n, !!v]);
+try {
+  const f = document.getElementById('f'); await new Promise((r) => (f.onload = r)); const d = f.contentDocument;
+  const bytes = await (await fetch('/tests/fixtures/multi-ext.ipa')).arrayBuffer();
+  const file = new File([bytes], 'multi-ext.ipa'); const dt = new DataTransfer(); dt.items.add(file);
+  const inp = d.querySelector('#file'); inp.files = dt.files; inp.dispatchEvent(new Event('change'));
+  for (let i = 0; i < 100 && !d.querySelector('.icon'); i++) await new Promise((r) => setTimeout(r, 100));
+  ok('inspector shown', d.querySelector('.icon') && /Demo App/.test(d.body.innerText)); ok('bundle id', /com\.example\.demo/.test(d.body.innerText));
+  await new Promise((r) => setTimeout(r, 500)); ok('icon decoded', d.querySelector('#appicon').naturalWidth === 60);
+  d.querySelector('[data-t=explorer]').click(); await new Promise((r) => setTimeout(r, 200)); ok('tree rows', d.querySelectorAll('.tr').length > 0);
+  d.querySelector('#q').value = '.json'; d.querySelector('#q').dispatchEvent(new Event('input')); ok('ext search', d.querySelectorAll('.tr [data-nm]').length >= 1 && /config\.json/.test(d.querySelector('#tree').innerText));
+  d.querySelector('.tr [data-nm]').click(); await new Promise((r) => setTimeout(r, 400)); ok('preview text', /"k": 1/.test(d.querySelector('#preview').innerText));
+  d.querySelector('#pclose').click();
+  d.querySelector('[data-t=downloads]').click(); await new Promise((r) => setTimeout(r, 100));
+  d.defaultView.HTMLAnchorElement.prototype.click = function () { if (this.download) (R.clicked ||= []).push(this.download); };
+  for (const k of ['original', 'project', 'resources', 'report']) { d.querySelector(`[data-x=${k}]`).click(); for (let i = 0; i < 100 && !/ready|failed/.test(d.querySelector('#job').innerText); i++) await new Promise((r) => setTimeout(r, 100)); ok('export ' + k, /ready/.test(d.querySelector('#job').innerText)); R[k] = d.querySelector('#job').innerText.replace(/\s+/g, ' ').slice(0, 140); d.querySelector('#job').innerHTML = ''; }
+  d.querySelector('[data-t=security]').click(); ok('security', /FairPlay/.test(d.body.innerText));
+  R.networkRequests = performance.getEntriesByType('resource').filter((e) => !e.name.startsWith(location.origin)).length;
+  R.failed = R.steps.filter((s) => !s[1]).map((s) => s[0]);
+} catch (e) { R.error = String(e && e.stack || e); }
+out(R);
+</script>

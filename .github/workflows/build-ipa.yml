@@ -1,0 +1,158 @@
+name: Build Cairn IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  web-tests:
+    name: Web engine tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Generate fixtures
+        run: python3 web/scripts/make-fixtures.py
+      - name: Run web tests
+        working-directory: web
+        run: npm test
+      - name: Build web app
+        working-directory: web
+        run: npm run build
+      - name: Upload web dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+  ios-tests:
+    name: iOS unit tests + launch smoke
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Prepare WebDist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: ios/Resources/WebDist
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Run unit tests on simulator
+        working-directory: ios
+        run: |
+          set -eo pipefail
+          xcodebuild test \
+            -project Cairn.xcodeproj \
+            -scheme Cairn \
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -derivedDataPath build
+      - name: Build app for simulator
+        working-directory: ios
+        run: |
+          set -eo pipefail
+          xcodebuild build \
+            -project Cairn.xcodeproj \
+            -scheme Cairn \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Launch smoke test
+        run: |
+          set -eo pipefail
+          SIM="iPhone 16"
+          xcrun simctl boot "$SIM" 2>/dev/null || true
+          xcrun simctl bootstatus "$SIM" -b
+          xcrun simctl install "$SIM" ios/build/Build/Products/Debug-iphonesimulator/Cairn.app
+          xcrun simctl launch "$SIM" com.example.cairnipastudio
+          sleep 8
+          xcrun simctl spawn "$SIM" launchctl list | grep -c "cairnipastudio" || (echo "PROCESS DIED" && exit 1)
+          xcrun simctl terminate "$SIM" com.example.cairnipastudio || true
+
+  build-ipa:
+    name: Build unsigned IPA
+    needs: [web-tests]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Prepare WebDist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: ios/Resources/WebDist
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+      - name: Build app (unsigned, device)
+        working-directory: ios
+        run: |
+          set -eo pipefail
+          xcodebuild build \
+            -project Cairn.xcodeproj \
+            -scheme Cairn \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Package unsigned IPA
+        run: |
+          set -eo pipefail
+          APP="ios/build/Build/Products/Release-iphoneos/Cairn.app"
+          test -d "$APP"
+          rm -rf Payload Cairn-unsigned.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry Cairn-unsigned.ipa Payload
+          ls -la Cairn-unsigned.ipa
+      - name: Validate IPA
+        run: |
+          set -eo pipefail
+          test -f "Payload/Cairn.app/Info.plist"
+          test -f "Payload/Cairn.app/Cairn"
+          lipo -info Payload/Cairn.app/Cairn | grep -q arm64
+          test -f "Payload/Cairn.app/WebDist/index.html"
+          test -d "Payload/Cairn.app/WebDist/js"
+          BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Payload/Cairn.app/Info.plist)
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Payload/Cairn.app/Info.plist)
+          echo "bundle id: $BID  version: $VER"
+          test "$BID" = "com.example.cairnipastudio"
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cairn-unsigned-ipa
+          path: Cairn-unsigned.ipa
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [web-tests, ios-tests, build-ipa]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Cairn-unsigned-ipa
+          path: .
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: unsigned-v${{ github.run_number }}
+        run: |
+          gh release create "$TAG" Cairn-unsigned.ipa \
+            --title "Cairn unsigned IPA (build ${{ github.run_number }})" \
+            --notes "Unsigned IPA of the Cairn IPA Studio iOS app.
+          Built in CI from commit ${{ github.sha }}.
+          Sign it yourself with your own certificate. No Apple credentials are involved anywhere in this pipeline."

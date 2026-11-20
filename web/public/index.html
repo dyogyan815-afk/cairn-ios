@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self' blob: data:; frame-src blob:; object-src blob:; connect-src 'self' blob:; base-uri 'none'; form-action 'none'">
+<meta name="theme-color" content="#0f172a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Cairn — private IPA inspector &amp; extraction studio</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo">◭</span><b>Cairn</b><small>IPA Studio</small></div>
+  <span class="badge local" title="Nothing is uploaded. Parsing, hashing and ZIP building run inside this page.">🔒 Local only — no upload</span>
+  <select id="sessionSel" aria-label="Inspection sessions" hidden></select>
+</header>
+<nav id="nav" aria-label="Sections"></nav>
+<main id="view"></main>
+<aside id="preview" class="sheet" hidden></aside>
+<div id="toast" role="status"></div>
+<script type="module" src="js/ui/app.js"></script>
+</body>
+</html>
