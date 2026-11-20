@@ -103,3 +103,12 @@ notice.
 `MARKETING_VERSION` 1.0.0 → 1.1.0, `CURRENT_PROJECT_VERSION` 1 → 2 (ios/project.yml),
 `web/package.json` 1.0.0 → 1.1.0. Bundle ID unchanged (still defined in exactly
 one place).
+
+## v1.1 fix — versions in info.properties (literal)
+Observed in CI: xcodegen generates the Info.plist with literal defaults
+(CFBundleShortVersionString "1.0", CFBundleVersion "1") and does NOT expand the
+project-level MARKETING_VERSION/CURRENT_PROJECT_VERSION build settings into the
+plist — the base-settings bump alone produced an IPA still labelled 1.0. Versions
+are therefore written literally in `ios/project.yml` → `info.properties`
+(CFBundleShortVersionString "1.1.0", CFBundleVersion "2"). Bump future releases
+there. The validation step in CI prints bundle id + version on every build.

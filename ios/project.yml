@@ -33,6 +33,10 @@ targets:
       properties:
         CFBundleDisplayName: Cairn
         CFBundleName: Cairn
+        # Versions are written LITERALLY here (xcodegen ignores the
+        # MARKETING_VERSION build setting when generating the plist).
+        CFBundleShortVersionString: "1.1.0"
+        CFBundleVersion: "2"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
