@@ -2,7 +2,7 @@ import { scanIPA, buildTree, readFileBytes } from '../core/ipa.js';
 import { DOWNLOADS, buildOriginalZip, buildProjectZip, buildResourcesZip, buildReportZip, buildManifest, manifestCsv, sha256sums, verifyExport, selectRecords, reportMarkdown } from '../core/exporter.js';
 import { CATEGORY_LABELS, TEXT_EXT, IMAGE_EXT, looksText, sniff } from '../core/classify.js';
 import { parsePlist, plistDocument } from '../core/plist.js';
-import { parseMachO, isMachO } from '../core/macho.js';
+import { parseMachO, isMachO, objcNames } from '../core/macho.js';
 import { cgbiToPng, isCgBI } from '../core/cgbi.js';
 import { carveEntry } from '../core/carve.js';
 import { ZipWriter } from '../core/zip-writer.js';
@@ -16,6 +16,11 @@ function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } c
 function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage may be blocked */ } }
 function toast(m) { const t = $('#toast'); t.textContent = m; t.classList.add('on'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('on'), 3200); }
 const cur = () => S.cur;
+// Native app reports where an export landed (and if a save failed) — show it once.
+if (typeof window.addEventListener === 'function') {
+  window.addEventListener('cairnsaveok', (e) => toast(`📁 Saved in phone: Files app → On My iPhone → Cairn → ${e.detail?.file || 'Exports'}`));
+  window.addEventListener('cairnsavefail', (e) => toast(`⚠ Save failed: ${e.detail?.message || 'unknown error'}`));
+}
 
 // ---------- navigation ----------
 function renderNav() { $('#nav').innerHTML = TABS.map(([k, l]) => `<button data-t="${k}" class="${S.tab === k ? 'on' : ''}">${l}</button>`).join(''); }
@@ -256,6 +261,21 @@ function viewDownloads(v) {
   <div class="row" style="margin-top:10px"><button class="btn alt sm" data-x="manifest">manifest.json</button><button class="btn alt sm" data-x="csv">manifest.csv</button><button class="btn alt sm" data-x="sums">SHA256SUMS.txt</button><a class="btn alt sm" id="b-orig" download="${esc(cur().file.name)}">Original IPA (unmodified)</a></div></div><div id="job"></div>`;
   v.querySelectorAll('[data-x]').forEach((b) => (b.onclick = () => exportJob(b.dataset.x)));
   const u = URL.createObjectURL(cur().file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { const f = cur().file; if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(f, f.name); } };
+  if (window.__cairnFiles) drawPhoneFiles(v);
+}
+async function drawPhoneFiles(v) {
+  const card = document.createElement('div'); card.className = 'card'; v.appendChild(card);
+  card.innerHTML = `<h3>📁 Phone files</h3><p class="note">Everything Cairn saves stays here: <b>Files app → On My iPhone → Cairn → Exports</b>. From the Files app you can move any file anywhere on the phone. Share again at any time:</p><div id="pf-list"><p class="note">Loading…</p></div><div class="row" style="margin-top:8px"><button class="btn sm alt" id="pf-refresh">Refresh</button></div>`;
+  const draw = (d) => {
+    const files = (d && d.files) || [];
+    const el = $('#pf-list', card);
+    if (!files.length) { el.innerHTML = '<p class="note">No saved files yet. Build a ZIP above and it will appear here automatically.</p>'; return; }
+    el.innerHTML = files.map((f) => `<div class="row" style="border-bottom:1px solid var(--line);padding:6px 0"><span style="flex:1;word-break:break-all">${esc(f.name)}<div class="note">${formatBytes(f.size || 0)}</div></span><button class="btn sm" data-share="${esc(f.name)}">Share</button><button class="btn sm alt" data-del="${esc(f.name)}">Remove</button></div>`).join('');
+    el.querySelectorAll('[data-share]').forEach((b) => (b.onclick = () => window.__cairnFiles.share(b.dataset.share)));
+    el.querySelectorAll('[data-del]').forEach((b) => (b.onclick = async () => { window.__cairnFiles.del(b.dataset.del); await new Promise((r) => setTimeout(r, 300)); window.__cairnFiles.list().then(draw); }));
+  };
+  $('#pf-refresh', card).onclick = () => window.__cairnFiles.list().then(draw);
+  window.__cairnFiles.list().then(draw);
 }
 async function saveBlob(blob, name) {
   if (typeof window !== 'undefined' && window.__cairnNativeSaver) {
@@ -315,6 +335,35 @@ function viewSecurity(v) {
     if (a.entitlements) add('ok', 'Entitlements', Object.keys(a.entitlements).join(', '));
   } else add('warn', 'No app bundle', 'Not a standard IPA layout.');
   v.innerHTML = `<div class="card"><h3>Security analysis</h3><p class="note">Static, local checks of metadata only. Not a malware scan and not a guarantee of safety.</p>${F.map((f) => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tag ${f.lvl}">${f.lvl === 'ok' ? 'info' : f.lvl === 'warn' ? 'note' : 'issue'}</span><b>${esc(f.t)}</b><div class="note">${esc(f.d)}</div></div>`).join('')}</div>`;
+  fillExecutableNames(v);
+}
+async function fillExecutableNames(v) {
+  const m = cur().model, a = m.app;
+  const card = document.createElement('div'); card.className = 'card'; v.appendChild(card);
+  if (!a || !a.macho || !a.macho.ok) { card.innerHTML = '<h3>Names inside the executable</h3><p class="note">No readable Mach-O executable in this IPA.</p>'; return; }
+  if (a.encrypted) { card.innerHTML = '<h3>Names inside the executable</h3><p class="note">The executable is FairPlay-encrypted, so name tables are not readable. Everything else in the IPA is still fully available.</p>'; return; }
+  if (a.machoPartial) { card.innerHTML = '<h3>Names inside the executable</h3><p class="note">The executable is too large to read fully on this device, so name tables are unavailable.</p>'; return; }
+  card.innerHTML = '<h3>Names inside the executable</h3><p class="note">Reading…</p>';
+  try {
+    const rec = m.files.find((f) => f.path === a.executablePath);
+    const { bytes } = await readFileBytes(cur().file, rec, a.executableSize || rec.size);
+    const slice = a.macho.slices.find((s) => s.ok && !s.encrypted) || a.macho.slices[0];
+    const names = objcNames(bytes, slice);
+    if (!names.ok) { card.innerHTML = `<h3>Names inside the executable</h3><p class="note">${esc(names.error || 'Not readable.')}</p>`; return; }
+    const list = (arr, n) => arr.slice(0, n).map((x) => `<div style="word-break:break-all;font-family:monospace;font-size:12px;padding:1px 0">${esc(x)}</div>`).join('') || '<span class="note">none found</span>';
+    card.innerHTML = `<h3>Names inside the executable</h3>
+    <p class="note">Human-readable identifiers the compiler stored inside the binary (ObjC class and method names, C strings). This is a map of what is inside the program — <b>not</b> source code and not decompiled logic.</p>
+    <div class="row" style="margin:6px 0"><span class="tag info">classes</span><b>&nbsp;${names.classCount}</b><span class="tag info" style="margin-left:10px">methods</span><b>&nbsp;${names.methodCount}</b><span class="tag info" style="margin-left:10px">strings</span><b>&nbsp;${names.stringsTotal || 0}</b>${names.truncated ? '<span class="tag note" style="margin-left:10px">list truncated</span>' : ''}</div>
+    <details><summary style="cursor:pointer">Show classes (first 60)</summary><div style="max-height:180px;overflow:auto;margin-top:6px">${list(names.classes, 60)}</div></details>
+    <details style="margin-top:6px"><summary style="cursor:pointer">Show method names (first 60)</summary><div style="max-height:180px;overflow:auto;margin-top:6px">${list(names.methods, 60)}</div></details>
+    <details style="margin-top:6px"><summary style="cursor:pointer">Show strings (first 60)</summary><div style="max-height:180px;overflow:auto;margin-top:6px">${list(names.strings, 60)}</div></details>
+    <div class="row" style="margin-top:10px"><button class="btn sm" id="names-txt">Save full name list → .txt</button></div>`;
+    $('#names-txt', card).onclick = () => {
+      const L = ['Cairn IPA Studio — names inside the binary', `App: ${a.displayName} (${a.bundleId}) v${a.version} (${a.build})`, `IPA: ${m.fileName}`, `Generated: ${new Date().toISOString()}`, '', 'NOTE: These are identifier strings the compiler stored inside the executable (ObjC class/method names, C strings). This is not source code and not decompiled logic.', '', `CLASSES (${names.classCount})`, ...names.classes, '', `METHODS (${names.methodCount})`, ...names.methods];
+      if (names.strings && names.strings.length) L.push('', `STRINGS sample (${names.strings.length}${names.stringsTotal ? ' of ' + names.stringsTotal : ''})`, ...names.strings);
+      saveBlob(new Blob([L.join('\n')], { type: 'text/plain' }), 'BINARY_NAMES.txt');
+    };
+  } catch (e) { card.innerHTML = `<h3>Names inside the executable</h3><p class="note">Could not read the executable: ${esc(e.message)}</p>`; }
 }
 
 // ---------- settings ----------

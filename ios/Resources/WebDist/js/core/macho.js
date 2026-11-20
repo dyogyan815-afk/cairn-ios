@@ -45,7 +45,7 @@ function parseThin(u8) {
   let arch = CPU[cputype] || `cpu 0x${cputype.toString(16)}`;
   if (arch === 'arm') arch += ARM_SUB[cpusub] ? ARM_SUB[cpusub] : '';
   if (arch === 'arm64' && cpusub === 2) arch = 'arm64e';
-  const r = { ok: true, is64, arch, filetype: FILETYPE[filetype] || String(filetype), flags, pie: !!(flags & 0x200000), cmds: [], dylibs: [], weakDylibs: [], rpaths: [], segments: [], encryption: null, uuid: null, platform: null, minOS: null, sdk: null, codeSignature: null, entitlements: null, symtab: null, signals: {} };
+  const r = { ok: true, is64, arch, filetype: FILETYPE[filetype] || String(filetype), flags, pie: !!(flags & 0x200000), cmds: [], dylibs: [], weakDylibs: [], rpaths: [], segments: [], sections: [], encryption: null, uuid: null, platform: null, minOS: null, sdk: null, codeSignature: null, entitlements: null, symtab: null, signals: {} };
   let p = is64 ? 32 : 28;
   const end = Math.min(u8.length, p + sizeofcmds);
   const counts = {};
@@ -63,6 +63,16 @@ function parseThin(u8) {
       const o = p + 8, segname = cstr(u8, o, 16);
       const g = is64 ? { vmaddr: Number(dv.getBigUint64(o + 16, true)), vmsize: Number(dv.getBigUint64(o + 24, true)), fileoff: Number(dv.getBigUint64(o + 32, true)), filesize: Number(dv.getBigUint64(o + 40, true)), nsects: dv.getUint32(o + 56, true) } : { vmaddr: dv.getUint32(o + 16, true), vmsize: dv.getUint32(o + 20, true), fileoff: dv.getUint32(o + 24, true), filesize: dv.getUint32(o + 28, true), nsects: dv.getUint32(o + 48, true) };
       r.segments.push({ name: segname, ...g });
+      // Section headers (metadata only): segment_64 body after cmd/size is 64 bytes, segment_32 is 48.
+      const hdr = o + (is64 ? 64 : 48), shSz = is64 ? 80 : 68, offAt = is64 ? 48 : 40, sizeAt = is64 ? 40 : 36;
+      for (let s = 0; s < g.nsects; s++) {
+        const q = hdr + s * shSz;
+        if (q + shSz > u8.length) break;
+        const sect = cstr(u8, q, 16), sseg = cstr(u8, q + 16, 16);
+        const ssize = is64 ? Number(dv.getBigUint64(q + sizeAt, true)) : dv.getUint32(q + sizeAt, true);
+        const soff = dv.getUint32(q + offAt, true);
+        r.sections.push({ sect, seg: sseg, size: ssize, offset: soff });
+      }
     } else if (cmd === 0x21 || cmd === 0x2c) {
       r.encryption = { cryptoff: dv.getUint32(p + 8, true), cryptsize: dv.getUint32(p + 12, true), cryptid: dv.getUint32(p + 16, true) };
     } else if (cmd === 0x1b) r.uuid = [...u8.subarray(p + 8, p + 24)].map((b) => b.toString(16).padStart(2, '0')).join('').replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5').toUpperCase();
@@ -119,6 +129,50 @@ function parseSignature(u8, cs) {
     }
   }
   return out;
+}
+
+// ---------- Name tables left inside the binary ----------
+// Compilers store human-readable identifiers (ObjC class/method names, C strings)
+// as plain data sections. Listing them is standard binary inspection (like otool -s);
+// it is NOT decompilation and never claims to recover original source code.
+const OBJC_SECTIONS = { __objc_classname: 'classes', __objc_methname: 'methods', __objc_methtype: 'methodTypes' };
+export const OBJC_NAME_CAPS = { perSectionBytes: 4 << 20, maxNames: 300000, maxNameLen: 2000, cstringSample: 20000 };
+
+function cstrings(u8, start, size, cap, out) {
+  const end = Math.min(start + Math.min(size, cap), u8.length);
+  let s = start;
+  while (s < end && out.length < OBJC_NAME_CAPS.maxNames) {
+    let e = s;
+    while (e < end && u8[e] !== 0) e++;
+    if (e > s && e - s <= OBJC_NAME_CAPS.maxNameLen) out.push(String.fromCharCode(...u8.subarray(s, Math.min(e, s + 400))));
+    s = e + 1;
+  }
+}
+
+/** Pull the identifier tables from one parsed slice. slice = parsedMachO.slices[i]. */
+export function objcNames(u8, slice) {
+  if (!slice || !slice.ok) return { ok: false, error: 'Slice not readable.' };
+  if (slice.encrypted) return { ok: false, encrypted: true, error: 'Executable is FairPlay-encrypted: names are not readable.' };
+  const res = { ok: true, classes: [], methods: [], methodTypes: [], strings: [], truncated: false };
+  for (const sec of slice.sections || []) {
+    const kind = OBJC_SECTIONS[sec.sect];
+    if (kind && sec.size > 0) {
+      cstrings(u8, sec.offset, sec.size, OBJC_NAME_CAPS.perSectionBytes, res[kind]);
+      if (res[kind].length >= OBJC_NAME_CAPS.maxNames) res.truncated = true;
+    }
+  }
+  const cs = (slice.sections || []).find((x) => x.sect === '__cstring' && x.seg === '__TEXT');
+  if (cs && cs.size > 0) {
+    const tmp = [];
+    cstrings(u8, cs.offset, cs.size, OBJC_NAME_CAPS.perSectionBytes, tmp);
+    res.stringsTotal = tmp.length;
+    res.strings = tmp.slice(0, OBJC_NAME_CAPS.cstringSample);
+    if (tmp.length > OBJC_NAME_CAPS.cstringSample) res.truncated = true;
+  }
+  const uniq = (a) => (a.length > 400 ? [...new Set(a)] : a);
+  res.classes = uniq(res.classes); res.methods = uniq(res.methods);
+  res.classCount = res.classes.length; res.methodCount = res.methods.length;
+  return res;
 }
 
 export function summariseMachO(m) {

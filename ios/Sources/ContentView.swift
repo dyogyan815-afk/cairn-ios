@@ -34,8 +34,10 @@ struct WebView: UIViewRepresentable {
         config.setURLSchemeHandler(SchemeHandler(inbox: shell.inbox), forURLScheme: SchemeHandler.scheme)
 
         let bridge = SaveBridge()
+        let filesBridge = FilesBridge()
         let userContent = WKUserContentController()
         userContent.add(bridge, name: SaveBridge.messageHandlerName)
+        userContent.add(filesBridge, name: FilesBridge.messageHandlerName)
         userContent.addUserScript(
             WKUserScript(source: SaveBridge.userScriptSource,
                          injectionTime: .atDocumentEnd,

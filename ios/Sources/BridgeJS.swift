@@ -47,6 +47,24 @@ enum BridgeJS {
         }
       };
 
+      // Phone files: list / re-share / remove files saved in Documents/Exports.
+      var reqId = 0, pending = {};
+      window.addEventListener('cairnfiles', function (ev) {
+        var d = ev && ev.detail || {};
+        if (d.req && pending[d.req]) { pending[d.req](d); delete pending[d.req]; }
+      });
+      window.__cairnFiles = {
+        list: function () {
+          return new Promise(function (resolve) {
+            var r = ++reqId; pending[r] = resolve;
+            try { mh.postMessage({ kind: 'list', req: r }); } catch (e) { delete pending[r]; resolve({ files: [] }); }
+            setTimeout(function () { if (pending[r]) { delete pending[r]; resolve({ files: [] }); } }, 4000);
+          });
+        },
+        share: function (name) { try { mh.postMessage({ kind: 'share', name: String(name) }); } catch (e) {} },
+        del: function (name) { try { mh.postMessage({ kind: 'delete', name: String(name) }); } catch (e) {} }
+      };
+
       // Hand over the "Open in Cairn" inbox file (same-origin alias, so CSP holds).
       fetch('cairn://app/inbox/current').then(function (r) {
         if (!r.ok) return null;
