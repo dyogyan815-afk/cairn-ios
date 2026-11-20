@@ -50,18 +50,32 @@ jobs:
         run: |
           set -eo pipefail
           python3 - <<'PY'
-          import json, subprocess
+          import json, re, subprocess
           dt = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devicetypes", "-j"]))["devicetypes"]
-          phones = [d for d in dt if d["productFamily"] == "iPhone"]
-          dev_type = phones[-1]["identifier"]
+          phones = [d for d in dt if re.match(r"iPhone \d+", d["name"])]
+
+          def ver(s):
+              m = re.findall(r"\d+", s)
+              return [int(x) for x in m] or [0]
+
+          phones.sort(key=lambda d: ver(d["identifier"]), reverse=True)
           rt = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "runtimes", "-j"]))["runtimes"]
           ios_rt = [r for r in rt if r["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS")]
-          runtime = ios_rt[-1]["identifier"]
+          ios_rt.sort(key=lambda r: ver(r["identifier"]), reverse=True)
           name = "CI-iPhone"
           listed = subprocess.check_output(["xcrun", "simctl", "list", "devices"]).decode()
-          if name not in listed:
-              subprocess.check_call(["xcrun", "simctl", "create", name, dev_type, runtime])
-          print("simulator ready:", name, dev_type, runtime)
+          if name in listed:
+              print("simulator already exists:", name)
+              raise SystemExit(0)
+          for p in phones[:4]:
+              for r in ios_rt[:2]:
+                  try:
+                      subprocess.check_call(["xcrun", "simctl", "create", name, p["identifier"], r["identifier"]])
+                      print("simulator created:", p["identifier"], "+", r["identifier"])
+                      raise SystemExit(0)
+                  except subprocess.CalledProcessError as e:
+                      print("combo failed:", p["identifier"], "+", r["identifier"], "rc=", e.returncode)
+          raise SystemExit("FATAL: no working iPhone/runtime combo found")
           PY
       - name: Run unit tests on simulator
         working-directory: ios
