@@ -63,6 +63,11 @@ targets:
     platform: iOS
     sources:
       - path: Tests
+    settings:
+      base:
+        # Prevents the test bundle from emitting Cairn.swiftmodule, which would
+        # collide with the app target's module (root PRODUCT_NAME applies here).
+        PRODUCT_MODULE_NAME: CairnTests
 schemes:
   Cairn:
     build:
