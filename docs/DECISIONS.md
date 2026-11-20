@@ -39,11 +39,14 @@ chunking it does not duplicate memory. On `finish`, the app presents
 completion. Failures dispatch a `cairnsavefail` event the page toasts.
 In plain Safari (`messageHandlers` absent) the original download path is kept.
 
-## WKDownloadDelegate fallback
-Any `blob:`/download-style navigation that skips the bridge is handed to
-`WKDownloadDelegate`: written to a temp file, then the same share sheet. This
-covers e.g. the "Original IPA (unmodified)" link, which intentionally keeps its
-plain anchor behaviour.
+## Downloads — save bridge only (WKDownloadDelegate removed)
+The original plan included a `WKDownloadDelegate` fallback. During CI (Xcode 26
+SDK) it turned out the current WebKit SDK no longer exposes
+`WKWebView.downloadDelegate`, so the fallback was removed. Every real export
+path goes through the save bridge instead, including the "Original IPA
+(unmodified)" link, which calls `window.__cairnNativeSaver` directly in native
+mode. Stray `blob:`/`http(s)` navigations are cancelled by the navigation policy
+(prevents dead pages). This is **verified in CI** (compiles + tests pass).
 
 ## Verification levels (honesty policy)
 - **verified here**: web tests (16) run locally; app.js edits syntax-checked with

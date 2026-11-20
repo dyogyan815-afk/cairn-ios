@@ -232,7 +232,9 @@ final class SchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     private func respondFail(_ task: WKURLSchemeTask) {
-        if isLive(task) { task.didFailWithError(URLError(.fileReadUnknown)) }
+        if isLive(task) { task.didFailWithError(NSError(domain: NSCocoaErrorDomain,
+                                              code: NSFileReadUnknownError,
+                                              userInfo: [NSLocalizedDescriptionKey: "Cannot read inbox file"])) }
     }
 
     // MARK: - Live-task tracking (avoids crashing if WebKit cancels mid-stream)

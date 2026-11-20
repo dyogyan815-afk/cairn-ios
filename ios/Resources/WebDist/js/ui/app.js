@@ -161,14 +161,14 @@ function viewExtract(v) {
   v.innerHTML = `<div class="card"><h3>Extract everything</h3><p class="note">${st.files} files · ${st.folders} folders · ${formatBytes(st.bytes)}. Files are copied exactly as stored in the IPA — nothing is renamed, skipped or recompressed.</p>
   <div class="row"><button class="btn" id="b-all">Extract all → ZIP</button><button class="btn alt" id="b-sel">Selected files/folders → ZIP</button><button class="btn alt" data-go="explorer">Select files…</button><a class="btn alt" id="b-orig" download="${esc(s.file.name)}">Original IPA</a></div></div><div id="job"></div>`;
   $('#b-all').onclick = () => exportJob('original'); $('#b-sel').onclick = () => exportJob('selected');
-  const u = URL.createObjectURL(s.file); S.urls.push(u); $('#b-orig').href = u;
+  const u = URL.createObjectURL(s.file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(s.file, s.file.name); } };
 }
 function viewDownloads(v) {
   v.innerHTML = `<div class="card"><h3>Downloads</h3><p class="note">Every export is re-opened and checked against the archive (size + CRC${S.settings.deep ? ' + SHA-256' : ''}) before the download starts.</p>
   <div class="grid">${[['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}">Build &amp; download</button></div>`).join('')}</div>
   <div class="row" style="margin-top:10px"><button class="btn alt sm" data-x="manifest">manifest.json</button><button class="btn alt sm" data-x="csv">manifest.csv</button><button class="btn alt sm" data-x="sums">SHA256SUMS.txt</button><a class="btn alt sm" id="b-orig" download="${esc(cur().file.name)}">Original IPA (unmodified)</a></div></div><div id="job"></div>`;
   v.querySelectorAll('[data-x]').forEach((b) => (b.onclick = () => exportJob(b.dataset.x)));
-  const u = URL.createObjectURL(cur().file); S.urls.push(u); $('#b-orig').href = u;
+  const u = URL.createObjectURL(cur().file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { const f = cur().file; if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(f, f.name); } };
 }
 async function saveBlob(blob, name) {
   if (typeof window !== 'undefined' && window.__cairnNativeSaver) {
