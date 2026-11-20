@@ -188,6 +188,7 @@ jobs:
           TAG: unsigned-v${{ github.run_number }}
         run: |
           gh release create "$TAG" Cairn-unsigned.ipa \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Cairn unsigned IPA (build ${{ github.run_number }})" \
             --notes "Unsigned IPA of the Cairn IPA Studio iOS app.
           Built in CI from commit ${{ github.sha }}.
