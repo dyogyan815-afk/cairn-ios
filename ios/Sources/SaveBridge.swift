@@ -211,11 +211,9 @@ final class FilesBridge: NSObject, WKScriptMessageHandler {
     }
 
     static func sanitize(_ name: String) -> String? {
-        let clean = name
-            .replacingOccurrences(of: "\u{0}", with: "_")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "..", with: "__")
-        return clean.isEmpty || clean.contains("..") ? nil : clean
+        let clean = name.replacingOccurrences(of: "\u{0}", with: "_")
+        if clean.isEmpty || clean.contains("..") || clean.contains("/") || clean.hasPrefix(".") { return nil }
+        return clean
     }
 
     static func listExports(in dir: URL) -> [[String: Any]] {

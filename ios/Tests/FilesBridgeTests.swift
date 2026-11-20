@@ -11,8 +11,10 @@ final class FilesBridgeTests: XCTestCase {
         XCTAssertNil(FilesBridge.sanitize(""))
         XCTAssertNil(FilesBridge.sanitize("../secret"))
         XCTAssertNil(FilesBridge.sanitize("a..b/../c"))
-        XCTAssertNotNil(FilesBridge.sanitize("normal.zip"))
-        XCTAssertEqual(FilesBridge.sanitize("a/b.zip"), "a_b.zip")
+        XCTAssertNil(FilesBridge.sanitize("a/b.zip"))
+        XCTAssertNil(FilesBridge.sanitize(".hidden"))
+        XCTAssertEqual(FilesBridge.sanitize("normal.zip"), "normal.zip")
+        XCTAssertEqual(FilesBridge.sanitize("UUID-export ORIGINAL_IPA_CONTENTS.zip"), "UUID-export ORIGINAL_IPA_CONTENTS.zip")
     }
 
     func testListExportsReturnsFilesSortedByName() throws {
