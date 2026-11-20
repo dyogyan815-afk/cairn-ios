@@ -33,6 +33,7 @@ jobs:
 
   ios-tests:
     name: iOS unit tests + launch smoke
+    needs: [web-tests]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
