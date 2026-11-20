@@ -108,7 +108,11 @@ jobs:
           xcrun simctl install "$SIM" ios/build/Build/Products/Debug-iphonesimulator/Cairn.app
           xcrun simctl launch "$SIM" com.example.cairnipastudio
           sleep 8
-          if xcrun simctl spawn "$SIM" launchctl list | grep -q "cairnipastudio"; then
+          # Grep must NOT read from a pipe here: with pipefail, grep -q exiting
+          # early SIGPIPEs the upstream `launchctl` and the step fails even when
+          # the app IS alive (raced green in builds 9-10, failed in build 11).
+          xcrun simctl spawn "$SIM" launchctl list > /tmp/launchctl.txt 2>/dev/null || true
+          if grep -q "cairnipastudio" /tmp/launchctl.txt; then
             echo "APP ALIVE — smoke test passed"
           else
             echo "PROCESS DIED" && exit 1
