@@ -79,3 +79,27 @@ The app bundle makes no network requests and adds no ATS exceptions
 (`NSAppTransportSecurity` left empty). The CSP already blocks outbound
 connections. The only I/O is the scheme handler reading bundle resources and the
 inbox file.
+
+## v1.1 — engine addition: carve.js (hidden-image recovery)
+The earlier rule "web engine byte-identical to the uploaded zip" was a v1.0
+statement. For v1.1 the owner asked for MORE recoverable files; the engine now
+has ONE added module, `web/public/js/core/carve.js`, plus UI wiring in
+`web/public/js/ui/app.js` (Extraction tab card + binary-file preview button +
+CARVED_IMAGES.zip export). Every other core module is still byte-identical to
+the uploaded zip.
+
+Why carving: iOS apps store most images inside compiled asset catalogs
+(Assets.car), which never appear as loose files in the archive. Recovering the
+embedded PNG/CgBI/JPEG streams is pure extraction of what is literally inside
+the file — consistent with Cairn's inspect-and-export purpose. It is NOT
+decompilation: no source is recovered, no code is touched, and a candidate
+stream must parse completely (signature + full structure) before it is
+reported, so nothing is fabricated. Known trade-offs, shown in the UI:
+best-effort boundaries, an abandoned candidate can hide images behind it,
+limits at 300 images / 96 MB per container, scan stops early with an honest
+notice.
+
+## v1.1 — version bump
+`MARKETING_VERSION` 1.0.0 → 1.1.0, `CURRENT_PROJECT_VERSION` 1 → 2 (ios/project.yml),
+`web/package.json` 1.0.0 → 1.1.0. Bundle ID unchanged (still defined in exactly
+one place).

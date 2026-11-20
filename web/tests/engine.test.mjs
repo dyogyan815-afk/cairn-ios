@@ -9,6 +9,8 @@ import { buildOriginalZip, buildProjectZip, buildResourcesZip, buildReportZip, b
 import { parseMachO } from '../public/js/core/macho.js';
 import { parsePlist } from '../public/js/core/plist.js';
 import { cgbiToPng } from '../public/js/core/cgbi.js';
+import { carveBytes, carveEntry, ImageCarver } from '../public/js/core/carve.js';
+import { crc32 } from '../public/js/core/crc32.js';
 
 const F = (n) => { const b = new Blob([fs.readFileSync(new URL('./fixtures/' + n, import.meta.url))]); b.name = n; return b; };
 const sha = (u8) => createHash('sha256').update(u8).digest('hex');
@@ -118,4 +120,98 @@ test('CgBI PNG converts to a standard PNG with RGB order & straight alpha', asyn
   const { bytes } = await entryBytes(F('small.ipa'), rec.entry, null); const out = await cgbiToPng(bytes);
   let p = 8, idat = []; while (p < out.length) { const len = new DataView(out.buffer, out.byteOffset + p).getUint32(0); const t = String.fromCharCode(...out.subarray(p + 4, p + 8)); assert.notEqual(t, 'CgBI'); if (t === 'IDAT') idat.push(out.subarray(p + 8, p + 8 + len)); p += 12 + len; }
   const raw = zlib.inflateSync(Buffer.concat(idat)); assert.deepEqual([...raw.subarray(1, 5)], [199, 100, 50, 128]);
+});
+
+// ---------- image carving (v1.1) ----------
+const U = (buf) => new Uint8Array(buf);
+function pngChunk(type, data) {
+  const b = Buffer.alloc(12 + data.length);
+  b.writeUInt32BE(data.length, 0); b.write(type, 4, 'latin1'); data.copy(b, 8);
+  b.writeUInt32BE(crc32(U(b.subarray(4, 8 + data.length))), 8 + data.length);
+  return b;
+}
+function makePng({ cgbi = false } = {}) {
+  const ihdr = Buffer.from([0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0, 0, 0]); // 2x2 RGBA, 13 bytes
+  const raw = Buffer.from([0, 10, 20, 30, 40, 50, 60, 70, 80, 0, 90, 100, 110, 120, 130, 140, 150, 160]); // 2 rows of filter+2x4
+  // Real Apple CgBI files carry the CgBI chunk immediately after the signature, before IHDR.
+  const parts = cgbi ? [U(pngChunk('CgBI', Buffer.alloc(4))), U(pngChunk('IHDR', ihdr))] : [U(pngChunk('IHDR', ihdr))];
+  parts.push(U(pngChunk('IDAT', zlib.deflateRawSync(raw))), U(pngChunk('IEND', Buffer.alloc(0))));
+  const SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return Buffer.concat([SIG, ...parts]);
+}
+function makeJpeg() {
+  const entropy = Buffer.from([0xab, 0xff, 0x00, 0xd9, 0x12, 0x34, 0x56]); // FF00-stuffed pair + a D9 NOT preceded by FF
+  return Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 1, 1, 0, 0, 1, 0, 1, 0, 0]), // SOI + APP0
+    Buffer.concat([Buffer.from([0xff, 0xdb, 0x00, 0x43, 0x00]), Buffer.alloc(64, 7)]),                          // DQT
+    Buffer.from([0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x02, 0x00, 0x02, 1, 1, 0x11, 0]),                          // SOF0
+    Buffer.from([0xff, 0xda, 0x00, 0x08, 1, 1, 0, 0, 0x3f, 0]),                                                  // SOS
+    entropy, Buffer.from([0xff, 0xd9]),                                                                          // entropy + EOI
+  ]);
+}
+test('carve: recovers complete PNG / CgBI / JPEG streams, ignores noise and truncated streams', async () => {
+  const noise = Buffer.alloc(4096); noise.fill(0x5a);
+  const fakePng = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from([0, 0, 0, 5, 0x6a, 0x75, 0x6e, 0x6b]), Buffer.alloc(64, 1)]); // 'junk' chunk, never finishes
+  const fakeJpeg = Buffer.from([0xff, 0xd8, 0xff, 0x55, 0x55, 0x00, 0x11]); // SOI followed by invalid markers
+  const p1 = makePng(), p2 = makePng({ cgbi: true }), j1 = makeJpeg();
+  const gap = Buffer.alloc(300, 0x33);
+  const parts = [noise, fakePng, gap, fakeJpeg, gap, p1, gap, p2, gap, j1, noise];
+  const buf = Buffer.concat(parts);
+  const real = { p1: buf.indexOf(p1), p2: buf.indexOf(p2), j1: buf.indexOf(j1) };
+  const r = await carveBytes(U(buf), { minSize: 10 });
+  assert.equal(r.images.length, 3, `expected 3 images, got ${r.images.length}`);
+  assert.deepEqual(r.images.map((i) => i.kind).sort(), ['cgbi', 'jpeg', 'png']);
+  const byKind = Object.fromEntries(r.images.map((i) => [i.kind, i]));
+  assert.equal(byKind.png.offset, real.p1);
+  assert.equal(byKind.cgbi.offset, real.p2);
+  assert.equal(byKind.jpeg.offset, real.j1);
+  assert.deepEqual([...byKind.jpeg.bytes.subarray(0, 3)], [0xff, 0xd8, 0xff]);
+  assert.deepEqual([...byKind.jpeg.bytes.subarray(-2)], [0xff, 0xd9]);
+  assert.equal(Buffer.compare(Buffer.from(byKind.png.bytes), p1), 0, 'carved PNG is byte-identical to the embedded original');
+  const converted = await cgbiToPng(byKind.cgbi.bytes); // carved CgBI is a fully valid CgBI PNG
+  assert.ok(converted.length > 8);
+  assert.equal(r.limitReached, null);
+});
+
+test('carve: minSize filters out streams below the threshold', async () => {
+  const buf = Buffer.concat([Buffer.alloc(4096, 0x77), makePng(), Buffer.alloc(1024, 0x88)]);
+  const r = await carveBytes(U(buf), { minSize: 1024 });
+  assert.equal(r.images.length, 0); // a ~100-byte PNG is below the threshold
+  assert.equal(r.limitReached, null);
+  const r2 = await carveBytes(U(buf), { minSize: 10 });
+  assert.equal(r2.images.length, 1); // same buffer, low threshold -> recovered
+});
+
+test('carve: streaming feed in odd chunk sizes gives identical results', async () => {
+  const p1 = makePng(), j1 = makeJpeg();
+  const buf = Buffer.concat([Buffer.alloc(1000, 0x11), p1, Buffer.alloc(500, 0x22), j1, Buffer.alloc(300, 0x33)]);
+  const cv = new ImageCarver({ minSize: 10 });
+  const STEP = 137;
+  for (let i = 0; i < buf.length; i += STEP) cv.feed(U(buf.subarray(i, Math.min(buf.length, i + STEP))), i);
+  cv.end();
+  assert.equal(cv.images.length, 2);
+  assert.equal(cv.images[0].offset, 1000);
+  assert.equal(cv.images[0].size, p1.length);
+  assert.equal(cv.images[1].offset, 1000 + p1.length + 500);
+  assert.equal(Buffer.compare(Buffer.from(cv.images[1].bytes), j1), 0);
+});
+
+test('carve: maxImages limit and abort signal', async () => {
+  const p1 = makePng();
+  const buf = Buffer.concat([p1, Buffer.alloc(2048, 0x44), p1, Buffer.alloc(2048, 0x55), p1]);
+  const r = await carveBytes(U(buf), { minSize: 10, maxImages: 2 });
+  assert.equal(r.images.length, 2);
+  assert.equal(r.limitReached, 'maxImages');
+  await assert.rejects(() => carveBytes(U(buf), { minSize: 10, signal: AbortSignal.abort() }), /cancelled/i);
+});
+
+test('carve: carveEntry streams an IPA entry without loading it whole', async () => {
+  const blob = F('small.ipa');
+  const z = await openZip(blob);
+  const e = z.entries.find((x) => x.name.endsWith('AppIcon60x60@2x.png'));
+  const r = await carveEntry(blob, e, { minSize: 10 });
+  assert.ok(r.images.length >= 1);
+  assert.equal(r.images[0].kind, 'cgbi');
+  assert.equal(r.images[0].offset, 0);
+  assert.equal(r.images[0].size, e.usize);
 });

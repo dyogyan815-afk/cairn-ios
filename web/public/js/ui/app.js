@@ -4,7 +4,9 @@ import { CATEGORY_LABELS, TEXT_EXT, IMAGE_EXT, looksText, sniff } from '../core/
 import { parsePlist, plistDocument } from '../core/plist.js';
 import { parseMachO, isMachO } from '../core/macho.js';
 import { cgbiToPng, isCgBI } from '../core/cgbi.js';
-import { formatBytes, toHex } from '../core/util.js';
+import { carveEntry } from '../core/carve.js';
+import { ZipWriter } from '../core/zip-writer.js';
+import { formatBytes, toHex, throttle } from '../core/util.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -148,20 +150,105 @@ async function openPreview(f) {
     else if (sg.sig === 'Binary property list' || ext === 'plist' || ext === 'strings' && sg.sig === 'Binary property list') { const r = parsePlist((await readFileBytes(cur().file, f, 8 << 20)).bytes); body = `<p class="note">${r.format === 'binary' ? 'Binary plist, shown as XML. The file itself is not modified.' : 'XML plist'}</p><pre>${esc(plistDocument(r.value).slice(0, 200000))}</pre>`; }
     else if (isMachO(bytes)) { const full = (await readFileBytes(cur().file, f, 160 << 20)).bytes; const m = parseMachO(full); body = `<p class="note">Compiled machine code. No source code is recoverable from this file.</p>` + m.slices.map((x) => !x.ok ? `<p class="err">${esc(x.error)}</p>` : `<h3>${esc(x.arch)} · ${esc(x.filetype)}${x.encrypted ? ' · <span class="err">FairPlay-encrypted</span>' : ''}</h3>${dl({ UUID: esc(x.uuid), Platform: esc(x.platform), 'Min OS': esc(x.minOS), PIE: x.pie ? 'yes' : 'no', 'Stack canary': x.signals.stackCanary === undefined ? 'unknown' : x.signals.stackCanary ? 'yes' : 'no', ARC: x.signals.arc === undefined ? 'unknown' : x.signals.arc ? 'yes' : 'no', 'Debug symbols': x.hasDebugSymbols ? 'DWARF segment present' : 'none', 'Linked libraries': esc(x.dylibs.map((d) => d.name).join('\n')).replace(/\n/g, '<br>'), 'Load commands': esc(Object.entries(x.cmdCounts).map(([k, n]) => k + '×' + n).join(', ')) })}`).join('') + `<h3>First bytes</h3><div class="hex">${esc(hexDump(bytes, 256))}</div>`; }
     else if ((TEXT_EXT.has(ext) || looksText(bytes)) && sg.sig !== 'Binary property list') body = `${truncated ? '<p class="note">Showing the first 1 MB.</p>' : ''}<pre>${esc(new TextDecoder().decode(bytes))}</pre>`;
-    else body = `<p class="note">Binary file shown as raw bytes${f.category === 'ui' ? ' (compiled interface/asset data cannot be turned back into source)' : ''}. Nothing has been converted.</p><div class="hex">${esc(hexDump(bytes, 512))}</div>`;
+    else body = `<p class="note">Binary file shown as raw bytes${f.category === 'ui' ? ' (compiled interface/asset data cannot be turned back into source)' : ''}. Nothing has been converted.</p><div class="hex">${esc(hexDump(bytes, 512))}</div>${f.size >= 4096 ? '<div class="row" style="margin-top:8px"><button class="btn sm" id="p-carve">Find images in this file</button></div><div id="p-carve-out"></div>' : ''}`;
   } catch (e) { body = `<p class="err">Preview failed: ${esc(e.message)}</p>`; }
   P.innerHTML = head + body;
   $('#pclose').onclick = closePreview; $('#pcopy').onclick = () => { navigator.clipboard && navigator.clipboard.writeText(f.path).then(() => toast('Path copied'), () => toast('Copy not available')); };
   $('#pdl').onclick = () => exportJob('selected', { paths: new Set([f.path]), single: true });
+  const pc = $('#p-carve');
+  if (pc) pc.onclick = async () => {
+    const out = $('#p-carve-out'); out.innerHTML = '<p class="note">Scanning…</p>';
+    try {
+      const r = await carveEntry(cur().file, f.entry, { maxImages: 60 });
+      if (!r.images.length) { out.innerHTML = '<p class="note">No complete images were found in this file.</p>'; return; }
+      const all = r.images.map((im) => ({ ...im, container: f.path }));
+      out.innerHTML = `<div class="prev" style="display:flex;flex-wrap:wrap;gap:6px" id="one-grid"></div><div class="row" style="margin-top:8px"><button class="btn sm" id="one-dl">Download ${r.images.length} image${r.images.length === 1 ? '' : 's'} (ZIP)</button></div>${r.limitReached ? '<p class="note">Limit reached — shown/collected images stop early.</p>' : ''}`;
+      await drawThumbs($('#one-grid'), all, 12);
+      $('#one-dl').onclick = () => downloadCarved(all);
+    } catch (e) { out.innerHTML = `<p class="err">${e.code === 'aborted' ? 'Cancelled' : 'Scan failed: ' + esc(e.message)}</p>`; }
+  };
 }
 
 // ---------- extraction + downloads ----------
 function viewExtract(v) {
   const s = cur(), st = s.model.stats;
   v.innerHTML = `<div class="card"><h3>Extract everything</h3><p class="note">${st.files} files · ${st.folders} folders · ${formatBytes(st.bytes)}. Files are copied exactly as stored in the IPA — nothing is renamed, skipped or recompressed.</p>
-  <div class="row"><button class="btn" id="b-all">Extract all → ZIP</button><button class="btn alt" id="b-sel">Selected files/folders → ZIP</button><button class="btn alt" data-go="explorer">Select files…</button><a class="btn alt" id="b-orig" download="${esc(s.file.name)}">Original IPA</a></div></div><div id="job"></div>`;
+  <div class="row"><button class="btn" id="b-all">Extract all → ZIP</button><button class="btn alt" id="b-sel">Selected files/folders → ZIP</button><button class="btn alt" data-go="explorer">Select files…</button><a class="btn alt" id="b-orig" download="${esc(s.file.name)}">Original IPA</a></div></div>
+  <div class="card"><h3>Hidden images in compiled files</h3><p class="note">Apps keep most of their images inside compiled containers like <b>Assets.car</b> — those images never appear in the file list above. Cairn can recover the complete PNG/JPEG images stored inside such containers. Best-effort and local-only; the original file is never modified, and nothing is fabricated (only fully valid image streams are reported).</p>
+  <div class="row"><button class="btn" id="b-carve">Find hidden images</button></div><div id="carve"></div></div><div id="job"></div>`;
   $('#b-all').onclick = () => exportJob('original'); $('#b-sel').onclick = () => exportJob('selected');
+  $('#b-carve').onclick = () => carveJob($('#carve'));
+  if (s.carved) drawCarveResults($('#carve'));
   const u = URL.createObjectURL(s.file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(s.file, s.file.name); } };
+}
+
+// ---------- hidden-image carving (v1.1) ----------
+async function carveJob(out) {
+  const s = cur();
+  const files = s.model.files.filter((f) => !f.isDir && (f.ext === 'car' || f.category === 'ui' || (f.category === 'other' && f.size >= (1 << 20))));
+  files.sort((a, b) => b.size - a.size);
+  const pick = []; let total = 0;
+  for (const f of files) { if (pick.length >= 6) break; if (total + f.size > (512 << 20)) continue; pick.push(f); total += f.size; }
+  if (!pick.length) { out.innerHTML = '<div class="card"><p class="note">No compiled containers were found in this IPA — there is nothing to scan.</p></div>'; return; }
+  const ctl = new AbortController(); const results = []; let collected = 0;
+  const prog = throttle((p) => { const bar = out.querySelector('.bar > i'); if (bar && p.total) bar.style.width = Math.min(100, (p.scanned / p.total) * 100) + '%'; }, 120);
+  for (let i = 0; i < pick.length; i++) {
+    const f = pick[i];
+    out.innerHTML = `<div class="card"><h3>Scanning ${esc(f.path)}</h3><div class="bar"><i style="width:0%"></i></div><p class="note">Container ${i + 1}/${pick.length} · ${formatBytes(f.size)}${collected ? ` · ${collected} image${collected === 1 ? '' : 's'} so far` : ''}</p><button class="btn sm alt" id="cc">Cancel</button></div>`;
+    $('#cc').onclick = () => ctl.abort();
+    try {
+      const r = await carveEntry(s.file, f.entry, { signal: ctl.signal, onProgress: prog, maxImages: 300, maxCarvedBytes: 96 << 20 });
+      if (r.images.length) { results.push({ file: f, images: r.images, limitReached: r.limitReached, truncated: r.truncated }); collected += r.images.length; }
+    } catch (e) {
+      if (e.code === 'aborted') { out.innerHTML = '<div class="card"><p class="note">Cancelled — nothing was changed.</p></div>'; return; }
+      results.push({ file: f, images: [], error: e.message });
+    }
+    if (collected >= 400) break;
+  }
+  s.carved = results;
+  drawCarveResults(out);
+}
+function drawCarveResults(out) {
+  const results = cur().carved || [];
+  const all = results.flatMap((r) => r.images.map((im) => ({ ...im, container: r.file.path })));
+  if (!all.length) { out.innerHTML = '<div class="card"><p class="note">No complete images were found inside the compiled containers of this IPA.</p></div>'; return; }
+  const totalBytes = all.reduce((a, b) => a + b.size, 0);
+  out.innerHTML = `<div class="card"><h3 class="ok">Recovered ${all.length} image${all.length === 1 ? '' : 's'} · ${formatBytes(totalBytes)}</h3>
+  ${results.map((r) => `<div class="row"><span style="flex:1;word-break:break-all">${esc(r.file.path)}</span><span class="note">${r.images.length} image${r.images.length === 1 ? '' : 's'}${r.limitReached ? ' · limit reached, scan stopped early' : ''}${r.truncated ? ' · file partially scanned' : ''}</span></div>`).join('')}
+  <div class="prev" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px" id="carve-grid"></div>
+  <div class="row" style="margin-top:8px"><button class="btn" id="carve-dl">Download all images (ZIP)</button></div>
+  <p class="note">Apple CgBI images are converted to standard PNG inside the ZIP so they display anywhere; the originals inside the container are untouched. A MANIFEST.txt records where each image was found. Limits: first 300 images / 96 MB per container.</p></div>`;
+  drawThumbs($('#carve-grid'), all, 24);
+  $('#carve-dl').onclick = () => downloadCarved(all);
+}
+async function drawThumbs(grid, all, max) {
+  let n = 0;
+  for (const im of all) {
+    if (n >= max) { grid.insertAdjacentHTML('beforeend', `<span class="note" style="align-self:center">…and ${all.length - max} more</span>`); break; }
+    n++;
+    try {
+      let bytes = im.bytes, type = 'image/jpeg';
+      if (im.kind !== 'jpeg') { bytes = await cgbiToPng(im.bytes); type = 'image/png'; }
+      const u = URL.createObjectURL(new Blob([bytes], { type })); S.urls.push(u);
+      grid.insertAdjacentHTML('beforeend', `<img src="${u}" alt="" style="width:64px;height:64px;object-fit:contain;background:#0b1220;border:1px solid var(--line);border-radius:6px">`);
+    } catch { grid.insertAdjacentHTML('beforeend', `<span class="note">1 image could not be shown</span>`); }
+  }
+}
+async function downloadCarved(all) {
+  const zw = new ZipWriter(); const lines = ['file\tcontainer\toffset\tsize\tkind']; const used = new Map();
+  for (let i = 0; i < all.length; i++) {
+    const im = all[i];
+    let bytes = im.bytes, kind = im.kind;
+    if (kind !== 'jpeg') { try { bytes = await cgbiToPng(bytes); kind = 'png'; } catch { /* keep original bytes if conversion is impossible */ } }
+    const cont = (im.container.replace(/\/$/, '').split('/').pop() || 'container').replace(/\.[^.]*$/, '');
+    const stem = `${cont}_img_${String(i + 1).padStart(3, '0')}`;
+    const ext = kind === 'jpeg' ? 'jpg' : 'png';
+    let name = `${stem}.${ext}`; const seen = used.get(name) || 0; used.set(name, seen + 1); if (seen) name = `${stem}_${seen}.${ext}`;
+    lines.push(`${name}\t${im.container}\t${im.offset}\t${bytes.length}\t${im.kind}${im.kind !== kind ? ' → converted to ' + kind : ''}`);
+    zw.addBytes(`CARVED_IMAGES/${name}`, bytes);
+  }
+  zw.addBytes('CARVED_IMAGES/MANIFEST.txt', lines.join('\n'));
+  await saveBlob(zw.finish(), 'CARVED_IMAGES.zip');
 }
 function viewDownloads(v) {
   v.innerHTML = `<div class="card"><h3>Downloads</h3><p class="note">Every export is re-opened and checked against the archive (size + CRC${S.settings.deep ? ' + SHA-256' : ''}) before the download starts.</p>

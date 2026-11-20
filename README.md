@@ -33,13 +33,31 @@ cd ios && xcodegen generate         # after changing project.yml
 
 Every push to `main` (and every manual run) executes:
 
-1. **web-tests** — fixture generation + 16 engine tests + build.
+1. **web-tests** — fixture generation + 21 engine tests + build.
 2. **ios-tests** — XcodeGen, unit tests on simulator (MIME types, path-traversal
    rejection, Range responses, save-bridge temp-file logic), launch smoke test.
 3. **build-ipa** — Release build for device (`CODE_SIGNING_ALLOWED=NO`),
    package `Payload/` → `Cairn-unsigned.ipa`, validate (Info.plist, arm64 via
    `lipo`, WebDist files, bundle id).
 4. **release** — publishes `Cairn-unsigned.ipa` as a GitHub Release asset.
+
+## v1.1 — hidden-image recovery
+
+New engine module `web/public/js/core/carve.js`: recovers **complete, fully valid
+PNG / Apple CgBI PNG / JPEG streams embedded inside compiled containers**
+(`Assets.car`, nib archives, opaque data files). UI entry points: the
+**Extraction** tab ("Find hidden images", scans the largest containers with a
+progress bar and Cancel) and the file preview for binary files
+("Find images in this file"). Carved images can be exported as one ZIP
+(`CARVED_IMAGES.zip`) with a MANIFEST.txt recording container, byte offset,
+size and kind for every image.
+
+Guarantees (same as the rest of Cairn): the original file is never modified;
+nothing is fabricated — a carved image must parse completely (signature + full
+chunk/marker structure) before it is reported; best-effort by design; limits
+are shown in the UI (first 300 images / 96 MB per container, scanning stops
+early with an honest notice). No source code is recovered anywhere: compiled
+machine code stays unreadable, exactly as before.
 
 Latest release: see the **Releases** section of this repo.
 From an iPhone? Follow `docs/BUILD_FROM_IPHONE.md`.
