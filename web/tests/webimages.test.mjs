@@ -2,7 +2,7 @@
 // extraction, magic-byte validation, batching and honest failure reporting.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractImageUrls, resolveUrl, dedupe, appStoreUrls, imageKind, fetchAllWebImages } from '../public/js/core/webimages.js';
+import { extractImageUrls, resolveUrl, dedupe, appStoreUrls, imageKind, fetchAllWebImages, crawlSite, extractPageLinks } from '../public/js/core/webimages.js';
 import { Sha256 } from '../public/js/core/sha256.js';
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -159,4 +159,68 @@ test('fetchAllWebImages: abort keeps already-saved batches', async () => {
   assert.equal(r.aborted, true);
   assert.ok(r.downloaded < 8, 'stopped early');
   assert.ok(batches.length >= 1, 'images downloaded before the abort were saved');
+});
+
+// ---------- site crawl (v1.5.0): every image of the app's website, not just the landing page ----------
+
+function siteFetch(pages) {
+  const calls = [];
+  return {
+    calls,
+    doFetch: async (url) => {
+      calls.push(url);
+      const hit = pages[url];
+      if (!hit) return { ok: false, status: 404, error: 'HTTP 404 Not Found' };
+      return { ok: true, status: 200, finalUrl: url, bytes: new TextEncoder().encode(hit) };
+    },
+  };
+}
+
+test('extractPageLinks: same-host pages only, image URLs are not pages, junk skipped', () => {
+  const html = `
+  <a href="/gallery">gallery</a>
+  <a href="https://site.example/about.html">about</a>
+  <a href="https://other.example/external">external</a>
+  <a href="/logo.png">logo</a>
+  <a href="mailto:x@y.z">mail</a>
+  <a href="#top">top</a>
+  <a href="/missing-image.JPEG">image link</a>`;
+  const links = extractPageLinks(html, 'https://site.example/', 'site.example');
+  assert.deepEqual(links, [
+    'https://site.example/gallery',
+    'https://site.example/about.html',
+  ], 'same-host non-image pages, resolved, deduped');
+});
+
+test('crawlSite: collects image URLs from the landing page plus same-site pages it links', async () => {
+  const pages = {
+    'https://site.example/': `<img src="/hero.png"><a href="/shots">shots</a><a href="/press">press</a><a href="https://else.example/no">no</a>`,
+    'https://site.example/shots': `<img src="/s1.jpg"><img src="/s2.jpg"><a href="https://site.example/press">deep link</a>`,
+    'https://site.example/press': `<meta property="og:image" content="/press-kit.png"><img src="https://cdn.site.example/logo.webp">`,
+  };
+  const { doFetch, calls } = siteFetch(pages);
+  const r = await crawlSite({ startUrl: 'https://site.example/', firstHtml: pages['https://site.example/'], doFetch });
+  assert.equal(r.pagesVisited, 3, 'landing + 2 linked pages really fetched');
+  assert.ok(calls.includes('https://site.example/shots') && calls.includes('https://site.example/press'), 'linked pages fetched');
+  const imgs = r.images;
+  for (const must of ['https://site.example/hero.png', 'https://site.example/s1.jpg', 'https://site.example/s2.jpg', 'https://site.example/press-kit.png', 'https://cdn.site.example/logo.webp']) {
+    assert.ok(imgs.includes(must), `collected ${must}`);
+  }
+  assert.ok(!imgs.some((u) => u.includes('else.example')), 'external host never crawled or collected');
+});
+
+test('crawlSite: honest page cap and failure counting, abort stops the walk', async () => {
+  const pages = { 'https://s.example/': '' };
+  for (let i = 1; i <= 10; i++) pages[`https://s.example/p${i}`] = `<img src="/i${i}.png"><a href="/p${i + 1}">next</a>`;
+  const { doFetch, calls } = siteFetch(pages);
+  const ctl = new AbortController();
+  const r = await crawlSite({ startUrl: 'https://s.example/', firstHtml: pages['https://s.example/'], doFetch, maxPages: 4, signal: ctl.signal });
+  assert.ok(r.pagesVisited <= 5, `capped at maxPages (${r.pagesVisited} visited)`);
+  assert.ok(calls.length <= 5, 'no page fetched beyond the cap');
+  // 404 page counts as failed, not invented
+  const { doFetch: failFetch } = siteFetch({ 'https://x.example/': '<a href="/gone">gone</a><img src="/a.png">' });
+  const rf = await crawlSite({ startUrl: 'https://x.example/', firstHtml: '<a href="/gone">gone</a><img src="/a.png">', doFetch: failFetch });
+  assert.equal(rf.pagesFailed, 1, 'the failed page is counted');
+  assert.ok(rf.images.includes('https://x.example/a.png'), 'landing-page images still collected');
+  ctl.abort();
 });

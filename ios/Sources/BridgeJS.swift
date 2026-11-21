@@ -8,8 +8,17 @@ enum BridgeJS {
       'use strict';
       if (window.__cairnNativeInstalled) return;
       window.__cairnNativeInstalled = true;
-      var mh = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.cairnSave;
+      var handlers = window.webkit && window.webkit.messageHandlers;
+      var mh = handlers && handlers.cairnSave;
       if (!mh) return; // normal Safari: keep the existing download path
+      // Each feature speaks to its OWN native handler — the channel names must
+      // match ContentView.swift exactly. Posting a 'fetch' to cairnSave (as an
+      // earlier build did) meant SaveBridge ignored it silently and the page
+      // sat in its watchdog until 'timed out after 45 s' with no real fetch
+      // ever started. cairnFiles/cairnFetch are feature-detected so older
+      // builds degrade honestly instead of throwing.
+      var mhFiles = handlers && handlers.cairnFiles;
+      var mhFetch = handlers && handlers.cairnFetch;
       var CHUNK = 1024 * 1024; // 1 MB binary per message (~1.37 MB base64 body).
       // Large bodies (3-4 MB) were silently dropped by WebKit on device: the
       // 'begin'/'finish' messages arrived but every chunk was lost
@@ -120,49 +129,55 @@ enum BridgeJS {
       };
 
       // Phone files: list / re-share / remove files saved in Documents/Exports.
+      // These go to the cairnFiles handler (FilesBridge), never to cairnSave.
       var reqId = 0, pending = {};
       window.addEventListener('cairnfiles', function (ev) {
         var d = ev && ev.detail || {};
         if (d.req && pending[d.req]) { pending[d.req](d); delete pending[d.req]; }
       });
-      window.__cairnFiles = {
-        list: function () {
-          return new Promise(function (resolve) {
-            var r = ++reqId; pending[r] = resolve;
-            try { mh.postMessage({ kind: 'list', req: r }); } catch (e) { delete pending[r]; resolve({ files: [] }); }
-            setTimeout(function () { if (pending[r]) { delete pending[r]; resolve({ files: [] }); } }, 4000);
-          });
-        },
-        share: function (name) { try { mh.postMessage({ kind: 'share', name: String(name) }); } catch (e) {} },
-        del: function (name) { try { mh.postMessage({ kind: 'delete', name: String(name) }); } catch (e) {} }
-      };
+      if (mhFiles) {
+        window.__cairnFiles = {
+          list: function () {
+            return new Promise(function (resolve) {
+              var r = ++reqId; pending[r] = resolve;
+              try { mhFiles.postMessage({ kind: 'list', req: r }); } catch (e) { delete pending[r]; resolve({ files: [] }); }
+              setTimeout(function () { if (pending[r]) { delete pending[r]; resolve({ files: [] }); } }, 4000);
+            });
+          },
+          share: function (name) { try { mhFiles.postMessage({ kind: 'share', name: String(name) }); } catch (e) {} },
+          del: function (name) { try { mhFiles.postMessage({ kind: 'delete', name: String(name) }); } catch (e) {} }
+        };
+      }
 
       // Native HTTP fetch for the "Images from a link" feature. The page's CSP
       // blocks web-side network access by design, so this request goes out
-      // through the app instead — only when the page asks for it, only for
-      // http(s) URLs, with a hard byte cap enforced natively.
+      // through the app's cairnFetch handler (FetchBridge) — only when the page
+      // asks for it, only for http(s) URLs, with a hard byte cap enforced
+      // natively.
       var fetchReq = 0, fetchPending = {};
       window.addEventListener('cairnfetch', function (ev) {
         var d = ev && ev.detail || {};
         if (d.req && fetchPending[d.req]) { fetchPending[d.req](d); delete fetchPending[d.req]; }
       });
-      window.__cairnFetch = function (url, opts) {
-        opts = opts || {};
-        return new Promise(function (resolve) {
-          var r = ++fetchReq; fetchPending[r] = resolve;
-          try {
-            mh.postMessage({ kind: 'fetch', req: r, url: String(url), maxBytes: opts.maxBytes || 8 * 1024 * 1024 });
-          } catch (e) {
-            delete fetchPending[r];
-            resolve({ ok: false, error: 'bridge send failed' });
-            return;
-          }
-          var t = setTimeout(function () {
-            if (fetchPending[r]) { delete fetchPending[r]; resolve({ ok: false, error: 'timed out after ' + ((opts.timeoutMs || 45000) / 1000) + ' s' }); }
-          }, opts.timeoutMs || 45000);
-          if (t && typeof t.unref === 'function') { t.unref(); }
-        });
-      };
+      if (mhFetch) {
+        window.__cairnFetch = function (url, opts) {
+          opts = opts || {};
+          return new Promise(function (resolve) {
+            var r = ++fetchReq; fetchPending[r] = resolve;
+            try {
+              mhFetch.postMessage({ kind: 'fetch', req: r, url: String(url), maxBytes: opts.maxBytes || 8 * 1024 * 1024 });
+            } catch (e) {
+              delete fetchPending[r];
+              resolve({ ok: false, error: 'bridge send failed' });
+              return;
+            }
+            var t = setTimeout(function () {
+              if (fetchPending[r]) { delete fetchPending[r]; resolve({ ok: false, error: 'timed out after ' + ((opts.timeoutMs || 45000) / 1000) + ' s' }); }
+            }, opts.timeoutMs || 45000);
+            if (t && typeof t.unref === 'function') { t.unref(); }
+          });
+        };
+      }
 
       // Hand over the "Open in Cairn" inbox file (same-origin alias, so CSP holds).
       fetch('cairn://app/inbox/current').then(function (r) {

@@ -88,6 +88,55 @@ export function dedupe(list) {
   return out;
 }
 
+/** Every <a href> on a page that stays on the same site — used by crawlSite to
+ * walk the app's website so images from all its pages are collected, not only
+ * the landing page. Skips non-http links, in-page anchors, and direct image
+ * URLs (those are images, not pages to crawl). */
+export function extractPageLinks(html, baseUrl, keepHost) {
+  const out = [];
+  for (const tag of String(html || '').match(/<a\b[^>]*>/gi) || []) {
+    const href = attr(tag, 'href');
+    if (!href || href.startsWith('#')) continue; // in-page anchor, not a page
+    const abs = resolveUrl(href, baseUrl);
+    if (!abs || !/^https?:/i.test(abs)) continue;
+    let u; try { u = new URL(abs); } catch { continue; }
+    if (keepHost && u.hostname.toLowerCase() !== keepHost.toLowerCase()) continue;
+    if (IMG_EXT_RE.test(u.pathname)) continue; // that IS an image, not a page
+    out.push(abs);
+  }
+  return dedupe(out);
+}
+
+/** Walk an app's website (the page the user pasted plus same-site pages it
+ * links to) and collect every image URL found on each real page fetched.
+ * Bounded honestly: maxPages real page fetches, nothing invented. Progress
+ * reports each page so the UI can show real movement. */
+export async function crawlSite({ startUrl, firstHtml, doFetch, signal, maxPages = 40, onProgress = () => {} }) {
+  const base = (() => { try { return new URL(startUrl); } catch { return null; } })();
+  if (!base) return { images: [], pagesVisited: 0, pagesFailed: 0 };
+  const keepHost = base.hostname;
+  const images = dedupe(extractImageUrls(firstHtml || '', startUrl));
+  const queue = dedupe(extractPageLinks(firstHtml || '', startUrl, keepHost))
+    .filter((u) => u !== startUrl)
+    .slice(0, maxPages);
+  const visited = new Set([startUrl]);
+  let pagesVisited = 1, pagesFailed = 0, i = 0;
+  for (const pageUrl of queue) {
+    if (signal && signal.aborted) break;
+    if (visited.has(pageUrl)) continue;
+    visited.add(pageUrl);
+    onProgress({ page: i + 1, total: queue.length + 1, url: pageUrl });
+    i++;
+    let page;
+    try { page = await doFetch(pageUrl, { maxBytes: 8 << 20 }); } catch { pagesFailed++; continue; }
+    pagesVisited++;
+    if (!page || !page.ok || !page.bytes) { pagesFailed++; continue; }
+    const html = new TextDecoder('utf-8', { fatal: false }).decode(page.bytes);
+    for (const u of extractImageUrls(html, page.finalUrl || pageUrl)) images.push(u);
+  }
+  return { images: dedupe(images), pagesVisited, pagesFailed };
+}
+
 const SAFE_BASE = (s) => (String(s).split('?')[0].split('#')[0].split('/').pop() || '').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 48).replace(/^_+|_+$/g, '');
 
 /** Real magic-byte validation of a downloaded image. Returns a MIME kind or
@@ -117,7 +166,7 @@ const EXT_OF = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'i
  * Batch boundaries are driven by budgetBytes so memory stays bounded no
  * matter how many images the source page holds. Concurrency-safe: whichever
  * worker crosses the threshold flushes, the others join the next batch. */
-export async function fetchAllWebImages({ urls, pageUrl, doFetch, onBatch, onProgress, signal, budgetBytes = 220 << 20, maxImages = 50000, perImageMaxBytes = 25 << 20, concurrency = 3 }) {
+export async function fetchAllWebImages({ urls, pageUrl, doFetch, onBatch, onProgress, signal, budgetBytes = 220 << 20, maxImages = 50000, perImageMaxBytes = 25 << 20, concurrency = 6 }) {
   const failures = [];
   let downloaded = 0, bytesTotal = 0, batchIndex = 0;
   const savedBatches = [];
@@ -143,6 +192,7 @@ export async function fetchAllWebImages({ urls, pageUrl, doFetch, onBatch, onPro
   };
 
   const takeOne = async (url) => {
+    if (signal && signal.aborted) return; // no NEW fetches after abort
     const res = await doFetch(url, { maxBytes: perImageMaxBytes });
     if (!res || !res.ok || !res.bytes || !res.bytes.length) {
       failures.push({ url, reason: res && res.error ? res.error : `HTTP ${res && res.status || 'error'}` });
@@ -150,7 +200,8 @@ export async function fetchAllWebImages({ urls, pageUrl, doFetch, onBatch, onPro
     }
     const kind = imageKind(res.bytes);
     if (!kind) { failures.push({ url, reason: 'not an image (magic-byte check failed)' }); return; }
-    if (signal && signal.aborted) return;
+    // The bytes are real and already here: they are kept even when an abort
+    // lands mid-run — only fetches that have not started yet are skipped.
     if (!zw) startBatch(); // another worker may be mid-flush
     const ext = EXT_OF[kind] || (IMG_EXT_RE.exec(url) || [])[1] || 'img';
     const stem = SAFE_BASE(url) || 'image';

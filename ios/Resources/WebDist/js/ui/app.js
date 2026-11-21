@@ -12,7 +12,7 @@ import { disasm, DISASM_LIMITS } from '../core/disasm.js';
 import { readRecBytes } from '../core/pkg-utils.js';
 import { buildToolchainZip } from '../core/tcexport.js';
 import { buildAllInOneZip } from '../core/allinone.js';
-import { extractImageUrls, appStoreUrls, dedupe, fetchAllWebImages } from '../core/webimages.js';
+import { extractImageUrls, appStoreUrls, dedupe, fetchAllWebImages, crawlSite } from '../core/webimages.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -296,9 +296,23 @@ async function webImageJob(out) {
     const html = new TextDecoder('utf-8', { fatal: false }).decode(page.bytes);
     const tagged = extractImageUrls(html, page.finalUrl || pageUrl);
     const store = await appStoreUrls(doFetch, pageUrl);
-    const urls = dedupe([...store, ...tagged]);
-    if (!urls.length) { out.innerHTML = '<div class="card"><p class="note">No image links were found on that page. Some sites build their galleries with JavaScript after load — those image addresses never appear in the raw HTML, so there is nothing honest to download from this URL.</p></div>'; return; }
-    out.innerHTML = `<div class="card"><h3>Downloading ${urls.length} image${urls.length === 1 ? '' : 's'}…</h3><div class="bar"><i style="width:0%"></i></div>
+    // A plain website rarely puts every image on its landing page, so the same
+    // site's linked pages are fetched too (bounded, each fetched exactly once).
+    // App Store links skip the crawl: every same-host page there is ANOTHER
+    // app's store page, not this app's site.
+    let crawled = { images: [], pagesVisited: 0, pagesFailed: 0 };
+    if (!/apps\.apple\.com|itunes\.apple\.com/i.test(pageUrl)) {
+      out.innerHTML = `<div class="card"><h3>Scanning the site's pages…</h3><div class="bar"><i style="width:0%"></i></div><p class="note" id="wi-crawl">starting…</p><button class="btn sm alt" id="wi-cancel">Cancel</button></div>`;
+      $('#wi-cancel').onclick = () => ctl.abort();
+      crawled = await crawlSite({
+        startUrl: page.finalUrl || pageUrl, firstHtml: html, doFetch, signal: ctl.signal,
+        onProgress: (p) => { const s = $('#wi-crawl', out); const bar = out.querySelector('.bar > i'); if (bar) bar.style.width = Math.min(100, (p.page / p.total) * 100) + '%'; if (s) s.textContent = `page ${p.page} of ~${p.total}: ${p.url}`; },
+      });
+    }
+    const urls = dedupe([...store, ...tagged, ...crawled.images]);
+    if (!urls.length) { out.innerHTML = '<div class="card"><p class="note">No image links were found on that page' + (crawled.pagesVisited > 1 ? ` or on the ${crawled.pagesVisited} site pages scanned` : '') + '. Some sites build their galleries with JavaScript after load — those image addresses never appear in the raw HTML, so there is nothing honest to download from this URL.</p></div>'; return; }
+    const scanNote = crawled.pagesVisited > 1 ? ` · scanned ${crawled.pagesVisited} site pages${crawled.pagesFailed ? ` (${crawled.pagesFailed} failed)` : ''}` : '';
+    out.innerHTML = `<div class="card"><h3>Downloading ${urls.length} image${urls.length === 1 ? '' : 's'}${scanNote}…</h3><div class="bar"><i style="width:0%"></i></div>
     <p class="note" id="wi-stat">starting…</p><div class="prev" id="wi-thumbs" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
     <div id="wi-result"></div><button class="btn sm alt" id="wi-cancel2">Cancel</button></div>`;
     $('#wi-cancel2').onclick = () => ctl.abort();
@@ -319,10 +333,10 @@ async function webImageJob(out) {
     });
     const failList = r.failures.slice(0, 20).map((f) => `<div style="word-break:break-all">${esc(f.url)} — ${esc(f.reason)}</div>`).join('');
     const resEl = $('#wi-result', out);
-    if (resEl) resEl.insertAdjacentHTML('beforeend', `<p class="${r.aborted ? 'note' : 'ok'}">${r.aborted ? 'Cancelled —' : 'Done —'} ${r.downloaded} image${r.downloaded === 1 ? '' : 's'} downloaded (${formatBytes(r.bytesTotal)}) in ${r.batches.length} zip part${r.batches.length === 1 ? '' : 's'}${r.failures.length ? ` · ${r.failures.length} failed` : ''}.</p>
+    if (resEl) resEl.insertAdjacentHTML('beforeend', `<p class="${r.aborted ? 'note' : 'ok'}">${r.aborted ? 'Cancelled —' : 'Done —'} ${r.downloaded} image${r.downloaded === 1 ? '' : 's'} downloaded (${formatBytes(r.bytesTotal)}) in ${r.batches.length} zip part${r.batches.length === 1 ? '' : 's'}${r.failures.length ? ` · ${r.failures.length} failed` : ''}${scanNote}.</p>
       ${r.failures.length ? `<details><summary>Failed downloads (first 20 of ${r.failures.length})</summary>${failList}</details>` : ''}`);
     const cancel2 = $('#wi-cancel2', out); if (cancel2) cancel2.remove();
-    s.webimgs = { pageUrl, found: urls.length, ...r };
+    s.webimgs = { pageUrl, found: urls.length, pagesVisited: crawled.pagesVisited, ...r };
   } catch (e) {
     if (e && (e.name === 'AbortError' || e.code === 'aborted')) { out.innerHTML = '<div class="card"><p class="note">Cancelled — already-saved zip parts stay on the phone.</p></div>'; return; }
     out.innerHTML = `<div class="card"><p class="err">Image fetch failed: ${esc(e && e.message || e)}</p></div>`;
@@ -331,7 +345,7 @@ async function webImageJob(out) {
 function viewDownloads(v) {
   const tcDone = cur().tc && cur().tc.state === 'done';
   v.innerHTML = `<div class="card"><h3>Downloads</h3><p class="note">Every export is re-opened and checked against the archive (size + CRC${S.settings.deep ? ' + SHA-256' : ''}) before the download starts.</p>
-  <div class="grid">${[['allinone', 'ALL-IN-ONE_<app>.zip', 'One special file with EVERYTHING from this scan: info + report, every original file, 45-tool workspace'], ['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon'], ['toolchain', 'TOOLCHAIN_<app>.zip', '45-tool workspace: dependencies, full symbols, ObjC names, disassembly, audit, signatures, packages + tool-status CSV']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}" ${k === 'toolchain' && !tcDone ? 'disabled title="Wait for the toolchain pipeline to finish"' : ''}>Build &amp; download</button></div>`).join('')}</div>
+  <div class="grid">${[['allinone', 'ALL-IN-ONE_<app>.zip', 'One special file with EVERYTHING from this scan: info + report + project checklist, every original file, the app\'s Xcode project, 45-tool workspace'], ['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon'], ['toolchain', 'TOOLCHAIN_<app>.zip', '45-tool workspace: dependencies, full symbols, ObjC names, disassembly, audit, signatures, packages + tool-status CSV']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}" ${k === 'toolchain' && !tcDone ? 'disabled title="Wait for the toolchain pipeline to finish"' : ''}>Build &amp; download</button></div>`).join('')}</div>
   <div class="row" style="margin-top:10px"><button class="btn alt sm" data-x="manifest">manifest.json</button><button class="btn alt sm" data-x="csv">manifest.csv</button><button class="btn alt sm" data-x="sums">SHA256SUMS.txt</button><a class="btn alt sm" id="b-orig" download="${esc(cur().file.name)}">Original IPA (unmodified)</a></div></div><div id="job"></div>`;
   v.querySelectorAll('[data-x]').forEach((b) => (b.onclick = () => exportJob(b.dataset.x)));
   const u = URL.createObjectURL(cur().file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { const f = cur().file; if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(f, f.name); } };

@@ -1,6 +1,6 @@
 {
   "name": "cairn-ipa-studio",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Cairn: a private, fully local, browser-based IPA inspector and extraction studio.",
   "private": true,
   "type": "module",

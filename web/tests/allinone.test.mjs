@@ -44,7 +44,7 @@ const findBytes = async (z, blob, name) => {
   return decoder.decode((await entryBytes(blob, e, 64 << 20)).bytes);
 };
 
-test('allinone: one zip carries info + every original file + the 45-tool workspace', async () => {
+test('allinone: one zip carries info + every original file + xcode project + the 45-tool workspace', async () => {
   const { blob, model, infoPlist } = await buildSyntheticIPA();
   const tc = await runToolchain(blob, model, {});
   const r = await buildAllInOneZip(blob, model, { state: 'done', result: tc }, {});
@@ -53,19 +53,24 @@ test('allinone: one zip carries info + every original file + the 45-tool workspa
   const z = await openZip(r.blob, {});
   const names = z.entries.map((e) => e.name);
   const has = (n) => names.includes(r.root + n);
-  // info section = the complete report
-  for (const must of ['README-FIRST.txt', 'info/REPORT.md', 'info/analysis.json', 'info/manifest.json', 'info/manifest.csv', 'info/SHA256SUMS.txt']) {
+  // info section = the complete report + the real project checklist
+  for (const must of ['README-FIRST.txt', 'info/REPORT.md', 'info/analysis.json', 'info/manifest.json', 'info/manifest.csv', 'info/SHA256SUMS.txt', 'info/PROJECT-CHECKLIST.txt']) {
     assert.ok(has(must), `contains ${must}`);
   }
   // files section = every original path, original structure
   for (const must of ['files/Payload/Demo.app/Info.plist', 'files/Payload/Demo.app/Demo', 'files/Podfile.lock']) {
     assert.ok(has(must), `contains ${must}`);
   }
-  // toolchain section = the real workspace, stripped of its inner root
-  for (const must of ['toolchain/toolchain.json', 'toolchain/tool-status.csv', 'toolchain/dependencies/dependencies.txt', 'toolchain/audit/findings.txt', 'toolchain/REPORT.md']) {
+  // xcode section = the reconstructed project for THIS app
+  for (const must of ['xcode/Demo_App.xcodeproj/project.pbxproj', 'xcode/Supporting/Info.plist', 'xcode/Supporting/Info.plist.readable.xml', 'xcode/README_RECONSTRUCTION.md', 'xcode/project.manifest.json', 'xcode/Binaries/Demo']) {
     assert.ok(has(must), `contains ${must}`);
   }
   assert.ok(!names.some((n) => n.includes('TOOLCHAIN_WORKSPACE')), 'inner toolchain root folder is stripped, not nested');
+  // checklist tells the truth about this fixture: Podfile.lock present, no .swift sources
+  const ck = await findBytes(z, r.blob, r.root + 'info/PROJECT-CHECKLIST.txt');
+  assert.match(ck, /Podfile \/ Podfile\.lock\s+1 found/, 'Podfile.lock really detected');
+  assert.match(ck, /source files\s+0 found/, 'absent source honestly reported as 0');
+  assert.match(ck, /Info\.plist\s+yes/, 'Info.plist present');
   // byte-for-byte: the merged Info.plist is identical to the IPA's original
   const merged = await findBytes(z, r.blob, r.root + 'files/Payload/Demo.app/Info.plist');
   assert.equal(merged, infoPlist, 'merged file bytes are identical to the original');
@@ -90,9 +95,10 @@ test('allinone: without the pipeline the toolchain section is an honest NOT-RUN,
   const readme = await findBytes(z, r.blob, r.root + 'README-FIRST.txt');
   assert.match(readme, /NOT RUN YET/, 'README records the absence');
   assert.match(readme, /ئەم فایلە هەموو شتێکی ئەپەکە لەیەک فایلدا کۆدەکاتەوە/, 'README speaks Kurdish too');
-  // info + files still fully present
+  // info + files + xcode still fully present
   assert.ok(names.includes(r.root + 'info/manifest.json'), 'info section present');
   assert.ok(names.includes(r.root + 'files/Payload/Demo.app/Demo'), 'files section present');
+  assert.ok(names.includes(r.root + 'xcode/Demo_App.xcodeproj/project.pbxproj'), 'xcode section present');
 });
 
 test('allinone: aborted build refuses honestly (aborted code)', async () => {
