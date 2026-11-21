@@ -243,10 +243,18 @@ test('__cairnFetch resolves with a real error when the native side never answers
   const env = makeEnv();
   install(env);
   env.native.postMessage = () => { /* native never responds */ };
-  const t0 = Date.now();
-  const res = await env.window.__cairnFetch('https://example.com/slow.png', { timeoutMs: 300 });
-  const dt = Date.now() - t0;
-  assert.equal(res.ok, false);
-  assert.ok(res.error.includes('timed out'), `got: ${res.error}`);
-  assert.ok(dt < 5000, `must resolve via its own timeout (took ${dt} ms)`);
+  // The injected timeout calls .unref() (correct for the app). In Node that
+  // would let the event loop drain before the 300 ms timer fires, so hold the
+  // loop open for the duration of this test only.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    const t0 = Date.now();
+    const res = await env.window.__cairnFetch('https://example.com/slow.png', { timeoutMs: 300 });
+    const dt = Date.now() - t0;
+    assert.equal(res.ok, false);
+    assert.ok(res.error.includes('timed out'), `got: ${res.error}`);
+    assert.ok(dt < 5000, `must resolve via its own timeout (took ${dt} ms)`);
+  } finally {
+    clearInterval(keepAlive);
+  }
 });
