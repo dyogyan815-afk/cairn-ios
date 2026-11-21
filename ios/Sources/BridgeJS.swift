@@ -137,6 +137,33 @@ enum BridgeJS {
         del: function (name) { try { mh.postMessage({ kind: 'delete', name: String(name) }); } catch (e) {} }
       };
 
+      // Native HTTP fetch for the "Images from a link" feature. The page's CSP
+      // blocks web-side network access by design, so this request goes out
+      // through the app instead — only when the page asks for it, only for
+      // http(s) URLs, with a hard byte cap enforced natively.
+      var fetchReq = 0, fetchPending = {};
+      window.addEventListener('cairnfetch', function (ev) {
+        var d = ev && ev.detail || {};
+        if (d.req && fetchPending[d.req]) { fetchPending[d.req](d); delete fetchPending[d.req]; }
+      });
+      window.__cairnFetch = function (url, opts) {
+        opts = opts || {};
+        return new Promise(function (resolve) {
+          var r = ++fetchReq; fetchPending[r] = resolve;
+          try {
+            mh.postMessage({ kind: 'fetch', req: r, url: String(url), maxBytes: opts.maxBytes || 8 * 1024 * 1024 });
+          } catch (e) {
+            delete fetchPending[r];
+            resolve({ ok: false, error: 'bridge send failed' });
+            return;
+          }
+          var t = setTimeout(function () {
+            if (fetchPending[r]) { delete fetchPending[r]; resolve({ ok: false, error: 'timed out after ' + ((opts.timeoutMs || 45000) / 1000) + ' s' }); }
+          }, opts.timeoutMs || 45000);
+          if (t && typeof t.unref === 'function') { t.unref(); }
+        });
+      };
+
       // Hand over the "Open in Cairn" inbox file (same-origin alias, so CSP holds).
       fetch('cairn://app/inbox/current').then(function (r) {
         if (!r.ok) return null;

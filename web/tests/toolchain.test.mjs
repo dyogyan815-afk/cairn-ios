@@ -12,6 +12,7 @@ import { scanBuffer, scanFiles, findPem } from '../public/js/core/signatures.js'
 import { parsePodfileLock, parseCartfile, parsePackageResolved } from '../public/js/core/packages.js';
 import { auditApp } from '../public/js/core/audit.js';
 import { runToolchain, TOOLS, TOOL_BY_ID } from '../public/js/core/toolchain.js';
+import { buildToolchainZip } from '../public/js/core/tcexport.js';
 import { loadDisasm, disasm } from '../public/js/core/disasm.js';
 import { scanIPA } from '../public/js/core/ipa.js';
 import { ZipWriter } from '../public/js/core/zip-writer.js';
@@ -247,4 +248,43 @@ test('toolchain: full pipeline runs on a real synthetic IPA and produces real re
   assert.match(capstone.summary, /instructions/, 'capstone record carries real counts');
   // summary counts consistent
   assert.equal(r.counts.host, TOOLS.filter((t) => t.status === 'host').length);
+});
+
+// ---------- toolchain workspace ZIP export (v1.3.1) ----------
+test('tcexport: workspace ZIP holds real files mirroring the IPA structure', async () => {
+  const { blob, model } = await buildSyntheticIPA();
+  const tc = await runToolchain(blob, model, {});
+  const { blob: zipBlob, root, notes } = await buildToolchainZip(blob, model, tc, {});
+  assert.ok(root.startsWith('Demo_') && root.endsWith('/'), `root folder named after the app: ${root}`);
+  const z = await (await import('../public/js/core/zip-reader.js')).openZip(zipBlob, {});
+  const names = z.entries.map((e) => e.name);
+  const has = (n) => names.some((x) => x === root + n);
+  for (const must of ['toolchain.json', 'tool-status.csv', 'REPORT.md', 'README_WORKSPACE.md',
+    'dependencies/dependencies.txt', 'dependencies/missing.txt', 'dependencies/unique.txt',
+    'audit/findings.txt', 'audit/audit.json', 'packages/manifests.txt', 'packages/packages.json',
+    'signatures/signatures.txt']) {
+    assert.ok(has(must), `workspace contains ${must}`);
+  }
+  // full symbol list re-run: real symbol names from the fixture must appear
+  const symName = names.find((x) => x.includes('symbols/Payload/Demo.app/Demo.symbols.txt'));
+  assert.ok(symName, `symbol file mirrors IPA path: ${names.filter((n) => n.includes('symbols/')).join(', ')}`);
+  const symTxt = new TextDecoder().decode((await (await import('../public/js/core/zip-reader.js')).entryBytes(zipBlob, z.entries.find((e) => e.name === symName))).bytes);
+  assert.match(symTxt, /main\.ContentView|MyWorker/, 'real symbol names present');
+  assert.ok(symTxt.includes('[' + 'm' + 'ain.ContentView]'), 'demangled names rendered in brackets');
+  // deps file carries the real links incl. the missing one
+  const depsTxt = new TextDecoder().decode((await (await import('../public/js/core/zip-reader.js')).entryBytes(zipBlob, z.entries.find((e) => e.name.endsWith('dependencies.txt')))).bytes);
+  assert.match(depsTxt, /ThirdParty\.framework\/ThirdParty/, 'dependency list carries the real link');
+  const missingTxt = new TextDecoder().decode((await (await import('../public/js/core/zip-reader.js')).entryBytes(zipBlob, z.entries.find((e) => e.name.endsWith('missing.txt')))).bytes);
+  assert.match(missingTxt, /ThirdParty/, 'missing dependency honestly recorded');
+  // disasm file with real instructions
+  const disName = names.find((x) => x.includes('disasm/') && x.endsWith('.disasm.txt'));
+  assert.ok(disName, `disassembly exported: ${names.filter((n) => n.includes('disasm/')).join(', ')}`);
+  const disTxt = new TextDecoder().decode((await (await import('../public/js/core/zip-reader.js')).entryBytes(zipBlob, z.entries.find((e) => e.name === disName))).bytes);
+  assert.match(disTxt, /0x[0-9a-f]{8}/, 'disassembly has real addresses');
+  // tool-status CSV: one row per registered tool
+  const csv = new TextDecoder().decode((await (await import('../public/js/core/zip-reader.js')).entryBytes(zipBlob, z.entries.find((e) => e.name.endsWith('tool-status.csv')))).bytes);
+  assert.ok(csv.trim().split('\n').length - 1 >= 45, 'one CSV row per tool');
+  // podfile packages present
+  const pkgTxt = new TextDecoder().decode((await (await import('../public/js/core/zip-reader.js')).entryBytes(zipBlob, z.entries.find((e) => e.name.endsWith('manifests.txt')))).bytes);
+  assert.match(pkgTxt, /Alamofire/, 'CocoaPods manifest content present');
 });

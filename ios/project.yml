@@ -6,7 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "1.3.0"
+    MARKETING_VERSION: "1.3.1"
     CURRENT_PROJECT_VERSION: "2"
     # Bundle ID is defined in exactly ONE documented place: here.
     # Change it here before re-signing with your own certificate.
@@ -35,8 +35,8 @@ targets:
         CFBundleName: Cairn
         # Versions are written LITERALLY here (xcodegen ignores the
         # MARKETING_VERSION build setting when generating the plist).
-        CFBundleShortVersionString: "1.3.0"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "1.3.1"
+        CFBundleVersion: "7"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -57,7 +57,11 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         UIFileSharingEnabled: true
         ITSAppUsesNonExemptEncryption: false
-        NSAppTransportSecurity: {}
+        # Arbitrary loads: the "Images from a link" feature fetches the exact
+        # URL the user pasted (possibly plain http) natively at the moment they
+        # tap it. No other network use exists in the app.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

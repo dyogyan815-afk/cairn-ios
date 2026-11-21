@@ -187,3 +187,66 @@ test('non-Blob input falls back to the browser download path (returns false)', a
   assert.equal(ok, false);
   assert.equal(env.messages.length, 0, 'no native messages for a non-Blob');
 });
+
+// ---------- window.__cairnFetch (native HTTP bridge for "Images from a link") ----------
+
+test('__cairnFetch is installed together with the saver', () => {
+  const env = makeEnv();
+  install(env);
+  assert.equal(typeof env.window.__cairnFetch, 'function', '__cairnFetch installed');
+});
+
+test('__cairnFetch posts a fetch message and resolves with the native response', async () => {
+  const env = makeEnv();
+  install(env);
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+  env.native.postMessage = (msg) => {
+    env.messages.push(msg);
+    if (msg.kind === 'fetch') {
+      queueMicrotask(() => env.window.dispatchEvent(new CustomEvent('cairnfetch', {
+        detail: {
+          req: msg.req, ok: true, status: 200,
+          finalUrl: msg.url,
+          data: Buffer.from(PNG).toString('base64'),
+        },
+      })));
+    }
+  };
+  const res = await env.window.__cairnFetch('https://example.com/a.png', { maxBytes: 1 << 20 });
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 200);
+  const bytes = new Uint8Array(Buffer.from(res.data, 'base64'));
+  assert.deepEqual([...bytes], [...PNG], 'bytes survive the bridge roundtrip');
+  const msg = env.messages.find((x) => x.kind === 'fetch');
+  assert.equal(msg.url, 'https://example.com/a.png');
+  assert.equal(msg.maxBytes, 1 << 20);
+  assert.equal(typeof msg.req, 'number');
+});
+
+test('__cairnFetch surfaces native errors (http status, bad scheme)', async () => {
+  const env = makeEnv();
+  install(env);
+  env.native.postMessage = (msg) => {
+    env.messages.push(msg);
+    if (msg.kind === 'fetch') {
+      queueMicrotask(() => env.window.dispatchEvent(new CustomEvent('cairnfetch', {
+        detail: { req: msg.req, ok: false, status: 404, error: 'HTTP 404 Not Found' },
+      })));
+    }
+  };
+  const res = await env.window.__cairnFetch('https://example.com/missing.png');
+  assert.equal(res.ok, false);
+  assert.equal(res.error, 'HTTP 404 Not Found');
+});
+
+test('__cairnFetch resolves with a real error when the native side never answers (no dead wait)', async () => {
+  const env = makeEnv();
+  install(env);
+  env.native.postMessage = () => { /* native never responds */ };
+  const t0 = Date.now();
+  const res = await env.window.__cairnFetch('https://example.com/slow.png', { timeoutMs: 300 });
+  const dt = Date.now() - t0;
+  assert.equal(res.ok, false);
+  assert.ok(res.error.includes('timed out'), `got: ${res.error}`);
+  assert.ok(dt < 5000, `must resolve via its own timeout (took ${dt} ms)`);
+});

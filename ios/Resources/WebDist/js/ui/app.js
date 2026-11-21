@@ -10,6 +10,8 @@ import { formatBytes, toHex, throttle } from '../core/util.js';
 import { runToolchain, TOOLS } from '../core/toolchain.js';
 import { disasm, DISASM_LIMITS } from '../core/disasm.js';
 import { readRecBytes } from '../core/pkg-utils.js';
+import { buildToolchainZip } from '../core/tcexport.js';
+import { extractImageUrls, appStoreUrls, dedupe, fetchAllWebImages } from '../core/webimages.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -191,9 +193,13 @@ function viewExtract(v) {
   v.innerHTML = `<div class="card"><h3>Extract everything</h3><p class="note">${st.files} files · ${st.folders} folders · ${formatBytes(st.bytes)}. Files are copied exactly as stored in the IPA — nothing is renamed, skipped or recompressed.</p>
   <div class="row"><button class="btn" id="b-all">Extract all → ZIP</button><button class="btn alt" id="b-sel">Selected files/folders → ZIP</button><button class="btn alt" data-go="explorer">Select files…</button><a class="btn alt" id="b-orig" download="${esc(s.file.name)}">Original IPA</a></div></div>
   <div class="card"><h3>Hidden images in compiled files</h3><p class="note">Apps keep most of their images inside compiled containers like <b>Assets.car</b> — those images never appear in the file list above. Cairn can recover the complete PNG/JPEG images stored inside such containers. Best-effort and local-only; the original file is never modified, and nothing is fabricated (only fully valid image streams are reported).</p>
-  <div class="row"><button class="btn" id="b-carve">Find hidden images</button></div><div id="carve"></div></div><div id="job"></div>`;
+  <div class="row"><button class="btn" id="b-carve">Find hidden images</button></div><div id="carve"></div></div>
+  <div class="card"><h3>Images from a link (App Store or website)</h3><p class="note">Paste the app's <b>App Store link</b> or the <b>official website</b> of the app: Cairn downloads <b>every image</b> that page references — App Store screenshots and artwork via Apple's public lookup API, website images from img/srcset/meta/CSS/JSON — then validates each download with the same magic-byte check the in-app tools use, hashes it (SHA-256) and packages everything into WEB_IMAGES zip parts that arrive in your phone like every other export. Batch size is capped so even 50,000 images stream through safely; failures are listed, never hidden.</p>
+  <div class="row"><input id="webimg-url" type="url" inputmode="url" placeholder="https://apps.apple.com/app/… or https://example.com" style="flex:1;min-width:200px" autocomplete="off"><button class="btn" id="b-webimg">Fetch all images</button></div>
+  <div id="webimg"></div></div><div id="job"></div>`;
   $('#b-all').onclick = () => exportJob('original'); $('#b-sel').onclick = () => exportJob('selected');
   $('#b-carve').onclick = () => carveJob($('#carve'));
+  $('#b-webimg').onclick = () => webImageJob($('#webimg'));
   if (s.carved) drawCarveResults($('#carve'));
   const u = URL.createObjectURL(s.file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(s.file, s.file.name); } };
 }
@@ -266,9 +272,65 @@ async function downloadCarved(all) {
   zw.addBytes('CARVED_IMAGES/MANIFEST.txt', lines.join('\n'));
   await saveBlob(zw.finish(), 'CARVED_IMAGES.zip');
 }
+
+// ---------- images from a pasted App Store / website link ----------
+async function webImageJob(out) {
+  const s = cur();
+  const input = $('#webimg-url');
+  const raw = (input && input.value || '').trim();
+  if (!raw) { out.innerHTML = '<p class="err">Paste a link first — the app\'s App Store page or the app\'s official website.</p>'; return; }
+  let pageUrl; try { pageUrl = new URL(raw).href; } catch { out.innerHTML = '<p class="err">That does not look like a valid link.</p>'; return; }
+  if (!/^https?:/i.test(pageUrl)) { out.innerHTML = '<p class="err">Only http(s) links can be fetched.</p>'; return; }
+  if (!window.__cairnFetch) {
+    out.innerHTML = '<p class="err">Network fetching runs inside the Cairn iOS app (the fetch goes out natively, only when you tap). In a plain browser the page\'s privacy policy (CSP) blocks outbound requests by design, so this feature is unavailable here.</p>';
+    return;
+  }
+  const ctl = new AbortController();
+  const doFetch = (url, opt = {}) => window.__cairnFetch(url, { maxBytes: opt.maxBytes || 8 << 20, timeoutMs: 45000 });
+  out.innerHTML = `<div class="card"><h3>Fetching page…</h3><div class="bar"><i style="width:5%"></i></div><p class="note">${esc(pageUrl)}</p><button class="btn sm alt" id="wi-cancel">Cancel</button></div>`;
+  $('#wi-cancel').onclick = () => ctl.abort();
+  try {
+    const page = await doFetch(pageUrl, { maxBytes: 16 << 20 });
+    if (!page || !page.ok) { out.innerHTML = `<div class="card"><p class="err">The page could not be fetched: ${esc(page && page.error || 'HTTP ' + (page && page.status || 'error'))}</p></div>`; return; }
+    const html = new TextDecoder('utf-8', { fatal: false }).decode(page.bytes);
+    const tagged = extractImageUrls(html, page.finalUrl || pageUrl);
+    const store = await appStoreUrls(doFetch, pageUrl);
+    const urls = dedupe([...store, ...tagged]);
+    if (!urls.length) { out.innerHTML = '<div class="card"><p class="note">No image links were found on that page. Some sites build their galleries with JavaScript after load — those image addresses never appear in the raw HTML, so there is nothing honest to download from this URL.</p></div>'; return; }
+    out.innerHTML = `<div class="card"><h3>Downloading ${urls.length} image${urls.length === 1 ? '' : 's'}…</h3><div class="bar"><i style="width:0%"></i></div>
+    <p class="note" id="wi-stat">starting…</p><div class="prev" id="wi-thumbs" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px"></div>
+    <div id="wi-result"></div><button class="btn sm alt" id="wi-cancel2">Cancel</button></div>`;
+    $('#wi-cancel2').onclick = () => ctl.abort();
+    const prog = throttle((p) => {
+      const bar = out.querySelector('.bar > i'); const stat = $('#wi-stat', out);
+      if (bar) bar.style.width = Math.min(100, (p.done / p.total) * 100) + '%';
+      if (stat) stat.textContent = `${p.done}/${p.total} processed · ${p.downloaded} downloaded · ${p.failed} failed${p.batchIndex ? ` · ${p.batchIndex} zip part${p.batchIndex === 1 ? '' : 's'} saved` : ''}`;
+    }, 150);
+    const r = await fetchAllWebImages({
+      urls, pageUrl, doFetch, signal: ctl.signal,
+      onProgress: prog,
+      onBatch: async ({ name, blob, count, bytes }) => {
+        await saveBlob(blob, name);
+        const res = $('#wi-result', out);
+        if (res) res.insertAdjacentHTML('beforeend', `<p class="ok">Saved ${esc(name)} — ${count} images · ${formatBytes(bytes)}</p>`);
+        if (window.__cairnFiles && $('#pf-refresh')) { try { window.__cairnFiles.list().then(() => {}); } catch { /* phone list refresh is optional */ } }
+      },
+    });
+    const failList = r.failures.slice(0, 20).map((f) => `<div style="word-break:break-all">${esc(f.url)} — ${esc(f.reason)}</div>`).join('');
+    const resEl = $('#wi-result', out);
+    if (resEl) resEl.insertAdjacentHTML('beforeend', `<p class="${r.aborted ? 'note' : 'ok'}">${r.aborted ? 'Cancelled —' : 'Done —'} ${r.downloaded} image${r.downloaded === 1 ? '' : 's'} downloaded (${formatBytes(r.bytesTotal)}) in ${r.batches.length} zip part${r.batches.length === 1 ? '' : 's'}${r.failures.length ? ` · ${r.failures.length} failed` : ''}.</p>
+      ${r.failures.length ? `<details><summary>Failed downloads (first 20 of ${r.failures.length})</summary>${failList}</details>` : ''}`);
+    const cancel2 = $('#wi-cancel2', out); if (cancel2) cancel2.remove();
+    s.webimgs = { pageUrl, found: urls.length, ...r };
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || e.code === 'aborted')) { out.innerHTML = '<div class="card"><p class="note">Cancelled — already-saved zip parts stay on the phone.</p></div>'; return; }
+    out.innerHTML = `<div class="card"><p class="err">Image fetch failed: ${esc(e && e.message || e)}</p></div>`;
+  }
+}
 function viewDownloads(v) {
+  const tcDone = cur().tc && cur().tc.state === 'done';
   v.innerHTML = `<div class="card"><h3>Downloads</h3><p class="note">Every export is re-opened and checked against the archive (size + CRC${S.settings.deep ? ' + SHA-256' : ''}) before the download starts.</p>
-  <div class="grid">${[['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}">Build &amp; download</button></div>`).join('')}</div>
+  <div class="grid">${[['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon'], ['toolchain', 'TOOLCHAIN_<app>.zip', '45-tool workspace: dependencies, full symbols, ObjC names, disassembly, audit, signatures, packages + tool-status CSV']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}" ${k === 'toolchain' && !tcDone ? 'disabled title="Wait for the toolchain pipeline to finish"' : ''}>Build &amp; download</button></div>`).join('')}</div>
   <div class="row" style="margin-top:10px"><button class="btn alt sm" data-x="manifest">manifest.json</button><button class="btn alt sm" data-x="csv">manifest.csv</button><button class="btn alt sm" data-x="sums">SHA256SUMS.txt</button><a class="btn alt sm" id="b-orig" download="${esc(cur().file.name)}">Original IPA (unmodified)</a></div></div><div id="job"></div>`;
   v.querySelectorAll('[data-x]').forEach((b) => (b.onclick = () => exportJob(b.dataset.x)));
   const u = URL.createObjectURL(cur().file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { const f = cur().file; if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(f, f.name); } };
@@ -317,6 +379,12 @@ async function exportJob(kind, opt = {}) {
     else if (kind === 'project') { res = await buildProjectZip(s.file, s.model, o); name = DOWNLOADS.project; }
     else if (kind === 'resources') { res = await buildResourcesZip(s.file, s.model, o); name = DOWNLOADS.resources; }
     else if (kind === 'report') { res = await buildReportZip(s.file, s.model, o); name = DOWNLOADS.report; }
+    else if (kind === 'toolchain') {
+      const tc = s.tc;
+      if (!tc || tc.state !== 'done') { jobEl().innerHTML = `<div class="card"><p class="note">The 45-tool pipeline has not finished yet. Wait for it to complete, then build this ZIP.</p></div>`; return; }
+      name = `TOOLCHAIN_${(s.model.app && (s.model.app.displayName || s.model.app.name) || s.model.fileName.replace(/\.[^.]+$/, '')).replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60)}.zip`;
+      res = await buildToolchainZip(s.file, s.model, tc.result, o);
+    }
     let ver = null;
     if (expected) ver = await verifyExport(res.blob, expected, { deep: S.settings.deep, signal: ctl.signal });
     if (ver && !ver.ok) { jobEl().innerHTML = `<div class="card"><h3 class="err">Verification failed — download withheld</h3><p>Missing: ${ver.missing.length}, mismatched: ${ver.mismatched.length}</p></div>`; return; }
@@ -434,7 +502,8 @@ function viewTools(v) {
   <div class="stat"><b>${r.counts.partial}</b><span>tools ran (subset)</span></div>
   <div class="stat"><b>${r.counts.host}</b><span>need a desktop</span></div>
   <div class="stat"><b class="${audit.score && audit.score.high ? 'err' : 'ok'}">${audit.findings ? audit.findings.length : 0}</b><span>audit findings</span></div></div>
-  <p class="note">Honest scope: 45 tools registered — ${r.counts.active + r.counts.partial} executed their core function on this file on-device; ${r.counts.host} require a Mac/PC environment and are listed with the reason (never simulated).</p></div>
+  <p class="note">Honest scope: 45 tools registered — ${r.counts.active + r.counts.partial} executed their core function on this file on-device; ${r.counts.host} require a Mac/PC environment and are listed with the reason (never simulated).</p>
+  <div class="row"><button class="btn" id="tc-zip">⬇ Download analysis workspace (ZIP)</button><span class="note"> every engine output as files: dependencies, symbols, ObjC names, disassembly, audit, signatures, packages.</span></div></div>
 
   <div class="card"><h3>🔗 Dependencies (otool -L across every binary)</h3>
   <p><b>${deps.linksTotal || 0}</b> links · <span class="tag ok">system ${deps.tally && deps.tally.system || 0}</span> <span class="tag info">embedded ${deps.tally && deps.tally.embedded || 0}</span> ${deps.tally && deps.tally.missing ? `<span class="tag bad">MISSING ${deps.tally.missing}</span>` : '<span class="tag ok">no missing libraries</span>'}</p>
@@ -473,6 +542,7 @@ function viewTools(v) {
     const rec = r.records.find((x) => x.id === t.id) || {};
     return `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b> ${statusChip(t)} ${toolChip(rec)} ${rec.ms !== undefined ? `<span class="tag note">${rec.ms} ms</span>` : ''}<div class="note">${esc(rec.summary && rec.summary !== 'subset ran' ? rec.summary : t.detail)}</div></div>`;
   }).join('')}</details>`).join('')}</div>`;
+  $('#tc-zip').onclick = () => exportJob('toolchain');
   bindDisasm(v);
 }
 async function bindDisasm(v) {
@@ -499,7 +569,8 @@ async function bindDisasm(v) {
 
 // ---------- settings ----------
 function viewSettings(v) {
-  v.innerHTML = `<div class="card"><h3>Privacy</h3><p class="ok">🔒 Everything runs in this page. This site makes no network requests with your files, has no analytics, and its Content-Security-Policy blocks outbound connections.</p></div>
+  v.innerHTML = `<div class="card"><h3>Privacy</h3><p class="ok">🔒 Everything runs in this page. No analytics, and its Content-Security-Policy blocks outbound connections.</p>
+  <p class="note">The one exception is the <b>Images from a link</b> feature (Extraction tab): nothing leaves the device until you tap “Fetch all images” — then only the link you pasted (plus the image files that page publishes) is fetched, natively by the app. Everything else stays local.</p></div>
   <div class="card"><h3>Options</h3><label class="row"><input type="checkbox" id="s-hist" ${S.settings.history ? 'checked' : ''} style="width:22px;height:22px"> Keep a local list of inspected files (names only)</label>
   <label class="row" style="margin-top:8px"><input type="checkbox" id="s-deep" ${S.settings.deep ? 'checked' : ''} style="width:22px;height:22px"> Deep-verify exports with SHA-256 (slower)</label>
   <div class="row" style="margin-top:10px"><button class="btn alt sm" id="s-clear">Clear history</button></div></div>

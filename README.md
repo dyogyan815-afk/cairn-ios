@@ -48,6 +48,33 @@ ran) or `desktop` (genuinely cannot run inside an iOS app — reason given,
 never simulated). The per-file execution record (status, duration, counts)
 is shown in the Toolchain tab.
 
+## v1.3.1 — Toolchain ZIP + images from a link
+
+**Toolchain analysis workspace as a ZIP.** The Toolchain tab and the ZIP
+Downloads tab can now package the whole run into
+`TOOLCHAIN_<AppName>.zip` (root folder `<AppName>_TOOLCHAIN_WORKSPACE/`):
+`toolchain.json` (complete machine-readable run record), `tool-status.csv`
+(one row per registered tool), `REPORT.md`, dependencies (per-binary
+otool-style lists, missing, unique), **full** symbol tables, **full** ObjC
+class/method lists, real Capstone disassembly of `__text` (first 4096
+instructions), signature scan, package manifests, audit findings — folders
+mirror the IPA's own paths. Full lists are re-computed by running the same
+engines again at export time; encrypted or unreadable binaries are recorded
+as such, never faked.
+
+**Images from a link (Extraction tab).** Paste an App Store link or the
+app's official website and Cairn fetches every image that page publishes:
+App Store screenshots/artwork via Apple's public `itunes.apple.com/lookup`
+API plus img/srcset/meta/CSS/JSON references in the page HTML. Every
+download is magic-byte-validated (a 404 HTML page is never reported as an
+image), SHA-256-hashed, and packaged into `WEB_IMAGES*.zip` parts with a
+MANIFEST (source URL, kind, hash per image). Batches flush at ~220 MB so
+even 50,000 images stream to the phone without exhausting memory; failures
+are listed, never hidden. The fetch runs NATIVELY in the app
+(`cairnFetch` bridge: http/https only, hard byte cap, transfer cancelled
+the moment the cap is exceeded) and only when you tap the button — the
+page itself keeps its strict CSP and never talks to the network on its own.
+
 ## Quick start (maintainer)
 
 ```
