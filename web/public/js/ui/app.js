@@ -11,6 +11,7 @@ import { runToolchain, TOOLS } from '../core/toolchain.js';
 import { disasm, DISASM_LIMITS } from '../core/disasm.js';
 import { readRecBytes } from '../core/pkg-utils.js';
 import { buildToolchainZip } from '../core/tcexport.js';
+import { buildAllInOneZip } from '../core/allinone.js';
 import { extractImageUrls, appStoreUrls, dedupe, fetchAllWebImages } from '../core/webimages.js';
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -330,7 +331,7 @@ async function webImageJob(out) {
 function viewDownloads(v) {
   const tcDone = cur().tc && cur().tc.state === 'done';
   v.innerHTML = `<div class="card"><h3>Downloads</h3><p class="note">Every export is re-opened and checked against the archive (size + CRC${S.settings.deep ? ' + SHA-256' : ''}) before the download starts.</p>
-  <div class="grid">${[['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon'], ['toolchain', 'TOOLCHAIN_<app>.zip', '45-tool workspace: dependencies, full symbols, ObjC names, disassembly, audit, signatures, packages + tool-status CSV']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}" ${k === 'toolchain' && !tcDone ? 'disabled title="Wait for the toolchain pipeline to finish"' : ''}>Build &amp; download</button></div>`).join('')}</div>
+  <div class="grid">${[['allinone', 'ALL-IN-ONE_<app>.zip', 'One special file with EVERYTHING from this scan: info + report, every original file, 45-tool workspace'], ['original', DOWNLOADS.original, 'Every file, original folder structure, byte-for-byte'], ['project', DOWNLOADS.project, 'Project-style workspace + manifest (resources only — no source is fabricated)'], ['resources', DOWNLOADS.resources, 'Source files if the IPA shipped any, plus images, fonts, audio, UI, localisation'], ['report', DOWNLOADS.report, 'Analysis report, manifest.json/.csv, SHA256SUMS, icon'], ['toolchain', 'TOOLCHAIN_<app>.zip', '45-tool workspace: dependencies, full symbols, ObjC names, disassembly, audit, signatures, packages + tool-status CSV']].map(([k, n, d]) => `<div class="card" style="margin:0"><b style="word-break:break-all">${n}</b><p class="note">${d}</p><button class="btn sm" data-x="${k}" ${k === 'toolchain' && !tcDone ? 'disabled title="Wait for the toolchain pipeline to finish"' : ''}>Build &amp; download</button></div>`).join('')}</div>
   <div class="row" style="margin-top:10px"><button class="btn alt sm" data-x="manifest">manifest.json</button><button class="btn alt sm" data-x="csv">manifest.csv</button><button class="btn alt sm" data-x="sums">SHA256SUMS.txt</button><a class="btn alt sm" id="b-orig" download="${esc(cur().file.name)}">Original IPA (unmodified)</a></div></div><div id="job"></div>`;
   v.querySelectorAll('[data-x]').forEach((b) => (b.onclick = () => exportJob(b.dataset.x)));
   const u = URL.createObjectURL(cur().file); S.urls.push(u); const b = $('#b-orig'); b.href = u; b.onclick = (e) => { const f = cur().file; if (window.__cairnNativeSaver) { e.preventDefault(); window.__cairnNativeSaver(f, f.name); } };
@@ -370,6 +371,11 @@ async function exportJob(kind, opt = {}) {
       await saveBlob(new Blob([t[0]], { type: t[2] }), t[1]); jobEl().innerHTML = `<div class="card ok">Saved ${t[1]} (${m.entries.length} entries).</div>`; return;
     }
     if (kind === 'original') { res = await buildOriginalZip(s.file, s.model, o); name = DOWNLOADS.original; expected = res.records; }
+    else if (kind === 'allinone') {
+      const appPart = (s.model.app && (s.model.app.displayName || s.model.app.name) || s.model.fileName.replace(/\.[^.]+$/, '')).replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60);
+      name = `ALL-IN-ONE_${appPart}.zip`;
+      res = await buildAllInOneZip(s.file, s.model, s.tc, o);
+    }
     else if (kind === 'selected') {
       const recs = selectRecords(s.model, { paths: opt.paths || s.selected, prefixes: opt.paths ? [] : [...s.prefixes] });
       if (!recs.length) { jobEl().innerHTML = `<div class="card err">Nothing is selected. Pick files or folders in the File Explorer first.</div>`; return; }
@@ -383,13 +389,14 @@ async function exportJob(kind, opt = {}) {
       const tc = s.tc;
       if (!tc || tc.state !== 'done') { jobEl().innerHTML = `<div class="card"><p class="note">The 45-tool pipeline has not finished yet. Wait for it to complete, then build this ZIP.</p></div>`; return; }
       name = `TOOLCHAIN_${(s.model.app && (s.model.app.displayName || s.model.app.name) || s.model.fileName.replace(/\.[^.]+$/, '')).replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60)}.zip`;
+      // (kept in sync with the ALL-IN-ONE naming below)
       res = await buildToolchainZip(s.file, s.model, tc.result, o);
     }
     let ver = null;
     if (expected) ver = await verifyExport(res.blob, expected, { deep: S.settings.deep, signal: ctl.signal });
     if (ver && !ver.ok) { jobEl().innerHTML = `<div class="card"><h3 class="err">Verification failed — download withheld</h3><p>Missing: ${ver.missing.length}, mismatched: ${ver.mismatched.length}</p></div>`; return; }
     const u = await saveBlob(res.blob, name);
-    jobEl().innerHTML = `<div class="card"><h3 class="ok">${esc(name)} ready</h3><p>${res.count} entries · ${formatBytes(res.blob.size)}${ver ? ` · <span class="ok">verified ${ver.verified}/${ver.expected} entries${ver.deep ? ' (SHA-256)' : ' (size + CRC)'}</span>` : ''}</p>${res.skipped && res.skipped.length ? `<p class="err">${res.skipped.length} entries could not be copied: ${esc(res.skipped.map((x) => x.path).join(', '))}</p>` : ''}${u ? `<p class="note">If the save sheet didn't appear, tap:</p><a class="btn sm" href="${u}" download="${esc(name)}">Save ${esc(name)}</a>` : ''}</div>`;
+    jobEl().innerHTML = `<div class="card"><h3 class="ok">${esc(name)} ready</h3><p>${res.count} entries · ${formatBytes(res.blob.size)}${ver ? ` · <span class="ok">verified ${ver.verified}/${ver.expected} entries${ver.deep ? ' (SHA-256)' : ' (size + CRC)'}</span>` : ''}</p>${kind === 'allinone' && res.toolchainState === 'not-run' ? '<p class="note">The 45-tool pipeline has not finished yet, so toolchain/ holds an honest NOT-RUN note instead of the workspace. Rebuild this package after the pipeline completes and the full workspace will be included.</p>' : ''}${res.skipped && res.skipped.length ? `<p class="err">${res.skipped.length} entries could not be copied: ${esc(res.skipped.map((x) => x.path).join(', '))}</p>` : ''}${u ? `<p class="note">If the save sheet didn't appear, tap:</p><a class="btn sm" href="${u}" download="${esc(name)}">Save ${esc(name)}</a>` : ''}</div>`;
   } catch (e) { jobEl().innerHTML = `<div class="card"><h3 class="err">${e.code === 'aborted' ? 'Cancelled' : 'Export failed'}</h3><p>${esc(e.message)}</p><p class="note">${e.code === 'aborted' ? '' : 'This can happen when the device runs out of memory on a very large IPA. Try exporting selected folders instead.'}</p></div>`; }
 }
 
