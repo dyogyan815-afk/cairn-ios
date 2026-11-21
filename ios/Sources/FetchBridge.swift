@@ -51,8 +51,10 @@ final class FetchBridge: NSObject, WKScriptMessageHandler {
             guard let data = try? JSONSerialization.data(withJSONObject: full, options: [.fragmentsAllowed]),
                   let json = String(data: data, encoding: .utf8) else { return }
             let js = "window.dispatchEvent(new CustomEvent('cairnfetch',{detail:\(json)}))"
+            // Test seam runs synchronously; the production path hops to the
+            // main queue before talking to the WebView.
+            if let responder = responderOverride { responder(js); return }
             DispatchQueue.main.async { [weak self] in
-                if let responder = self?.responderOverride { responder(js); return }
                 self?.webView?.evaluateJavaScript(js, completionHandler: nil)
             }
         }
