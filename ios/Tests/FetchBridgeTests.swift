@@ -20,7 +20,9 @@ final class FetchBridgeTests: XCTestCase {
         var last: Captured?
         bridge.responderOverride = { js in
             guard let range = js.range(of: "detail:") else { last = nil; return }
-            let json = String(js[range.upperBound...].dropLast(2)) // strip trailing "))"
+            var json = String(js[range.upperBound...])
+            // detail:{...}))  → strip the closing "}))" of dispatchEvent(...)
+            if json.hasSuffix("}))") { json = String(json.dropLast(3)) }
             let data = json.data(using: .utf8)!
             let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             last = Captured(js: js, detail: obj)
