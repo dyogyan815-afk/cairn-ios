@@ -7,10 +7,13 @@ import { cgbiToPng, isCgBI } from '../core/cgbi.js';
 import { carveEntry } from '../core/carve.js';
 import { ZipWriter } from '../core/zip-writer.js';
 import { formatBytes, toHex, throttle } from '../core/util.js';
+import { runToolchain, TOOLS } from '../core/toolchain.js';
+import { disasm, DISASM_LIMITS } from '../core/disasm.js';
+import { readRecBytes } from '../core/pkg-utils.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const TABS = [['home', 'Home'], ['inspect', 'IPA Inspector'], ['explorer', 'File Explorer'], ['extract', 'Extraction'], ['downloads', 'ZIP Downloads'], ['security', 'Security Analysis'], ['settings', 'Settings']];
+const TABS = [['home', 'Home'], ['inspect', 'IPA Inspector'], ['explorer', 'File Explorer'], ['extract', 'Extraction'], ['downloads', 'ZIP Downloads'], ['security', 'Security Analysis'], ['tools', 'Toolchain'], ['settings', 'Settings']];
 const S = { tab: 'home', sessions: [], cur: null, busy: null, settings: load('cairn.settings', { history: false, deep: false }), history: load('cairn.history', []), urls: [] };
 function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }
 function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage may be blocked */ } }
@@ -40,9 +43,9 @@ $('#sessionSel').addEventListener('change', (e) => { S.cur = S.sessions.find((s)
 
 function render() {
   const v = $('#view');
-  const needs = ['inspect', 'explorer', 'extract', 'downloads', 'security'].includes(S.tab);
+  const needs = ['inspect', 'explorer', 'extract', 'downloads', 'security', 'tools'].includes(S.tab);
   if (needs && !cur()) { v.innerHTML = `<div class="card"><h2>No IPA open</h2><p class="note">Open an IPA from Home first.</p><button class="btn" data-go="home">Go to Home</button></div>`; return; }
-  ({ home: viewHome, inspect: viewInspect, explorer: viewExplorer, extract: viewExtract, downloads: viewDownloads, security: viewSecurity, settings: viewSettings })[S.tab](v);
+  ({ home: viewHome, inspect: viewInspect, explorer: viewExplorer, extract: viewExtract, downloads: viewDownloads, security: viewSecurity, tools: viewTools, settings: viewSettings })[S.tab](v);
 }
 document.addEventListener('click', (e) => { const g = e.target.closest('[data-go]'); if (g) go(g.dataset.go); });
 
@@ -79,6 +82,8 @@ async function openFiles(files) {
       const model = await scanIPA(file, { signal: ctl.signal, onProgress: (p) => { S.busy.last = p; showProgress(p); } });
       const s = { id: Date.now() + Math.random(), file, model, tree: buildTree(model.files), selected: new Set(), prefixes: new Set(), expanded: new Set(['Payload/']), q: '', sort: 'name', results: {} };
       S.sessions.push(s); S.cur = s; renderSessionSel();
+      s.tc = { state: 'running', progress: { done: 0, current: 'starting' }, result: null };
+      runToolchainAuto(s); // full analysis pipeline, in background
       if (S.settings.history) { S.history = [{ name: file.name, size: file.size, app: model.app && model.app.bundleId, at: Date.now() }, ...S.history].slice(0, 20); save('cairn.history', S.history); }
       S.busy = null; go('inspect'); toast(`Opened ${file.name}`);
     } catch (e) {
@@ -103,7 +108,7 @@ async function viewInspect(v) {
   <div class="card"><h3>App extensions (${a.extensions.length})</h3>${a.extensions.map((f) => `<div>${esc(f.name)} <span class="note">${esc(f.bundleId || '')} ${esc(f.extensionPoint || '')}</span></div>`).join('') || '<span class="note">None.</span>'}</div>
   <div class="card"><h3>Signing</h3>${dl({ 'Code signature': a.codeSigned ? 'present' : 'not found', 'Signature identifier': esc(a.signatureIdentifier), 'Team (signature)': esc(a.teamIdFromSignature), Provisioning: a.provisioning ? esc(a.provisioning.error || `${a.provisioning.kind} · ${a.provisioning.name} · ${a.provisioning.teamName || ''}`) : 'no embedded profile', Expires: a.provisioning && esc(a.provisioning.expires) })}${a.entitlementsXml ? `<details><summary>Entitlements</summary><pre>${esc(a.entitlementsXml)}</pre></details>` : '<p class="note">No readable entitlements.</p>'}</div>` : ''}
   <div class="card"><h3>Components</h3><table>${Object.entries(st.byCategory).map(([k, c]) => `<tr><td>${esc(CATEGORY_LABELS[k] || k)}</td><td>${c.files}</td><td>${formatBytes(c.bytes)}</td></tr>`).join('')}</table></div>
-  <div class="row"><button class="btn" data-go="explorer">Open File Explorer</button><button class="btn alt" data-go="downloads">Downloads</button></div>`;
+  <div class="row"><button class="btn" data-go="explorer">Open File Explorer</button><button class="btn alt" data-go="downloads">Downloads</button><button class="btn alt" data-go="tools">Toolchain</button></div>`;
   if (a && a.icon) { try { const r = m.files.find((f) => f.path === a.icon); const { bytes } = await readFileBytes(cur().file, r, 8 << 20); const png = await cgbiToPng(bytes); const u = URL.createObjectURL(new Blob([png], { type: 'image/png' })); S.urls.push(u); const im = $('#appicon'); if (im) im.src = u; } catch { /* icon is optional */ } }
 }
 
@@ -370,6 +375,126 @@ async function fillExecutableNames(v) {
       saveBlob(new Blob([L.join('\n')], { type: 'text/plain' }), 'BINARY_NAMES.txt');
     };
   } catch (e) { card.innerHTML = `<h3>Names inside the executable</h3><p class="note">Could not read the executable: ${esc(e.message)}</p>`; }
+}
+
+// ---------- toolchain (45-tool unified analysis workspace) ----------
+async function runToolchainAuto(s) {
+  try {
+    const result = await runToolchain(s.file, s.model, {
+      onProgress: (p) => { s.tc.progress = p; if (S.tab === 'tools' && S.cur === s) drawToolProgress(); },
+    });
+    s.tc.state = 'done'; s.tc.result = result;
+    toast(`Toolchain finished: ${result.counts.active + result.counts.partial} tools ran · ${result.counts.host} need a desktop`);
+  } catch (e) {
+    s.tc.state = 'error'; s.tc.error = String(e && e.message || e);
+    toast('Toolchain run failed: ' + s.tc.error);
+  }
+  if (S.tab === 'tools' && S.cur === s) render();
+}
+function drawToolProgress() {
+  const el = $('#tc-progress'); if (!el) return;
+  const s = cur(); const p = s.tc.progress || {};
+  el.innerHTML = `<div class="bar"><i style="width:${Math.min(100, ((p.done || 0) / 8) * 100)}%"></i></div><p class="note">Running analysis engines… (${p.done || 0}/8 · ${esc(p.current || '')})</p>`;
+}
+function toolChip(r) {
+  if (r.status === 'host') return `<span class="tag bad" title="Needs a desktop computer">desktop required</span>`;
+  if (r.ran) return `<span class="tag ok" title="Ran on this file">✓ ran</span>`;
+  return `<span class="tag note">not applicable</span>`;
+}
+function statusChip(t) {
+  if (t.status === 'active') return '<span class="tag ok">active</span>';
+  if (t.status === 'partial') return '<span class="tag note">partial</span>';
+  return '<span class="tag bad">desktop</span>';
+}
+function viewTools(v) {
+  const s = cur(); const tc = s.tc || (s.tc = { state: 'idle', result: null });
+  const r = tc.result;
+  v.innerHTML = `<div class="card"><h2>Toolchain — 45-tool analysis workspace</h2>
+  <p class="note">Every compatible engine runs automatically when a file is opened. Results below are real output for <b>${esc(s.file.name)}</b>. Tools marked <b>desktop required</b> genuinely cannot execute inside an iOS app — they are not simulated; the note explains what Cairn provides instead.</p>
+  <div id="tc-progress">${tc.state === 'running' ? '<div class="bar"><i style="width:5%"></i></div><p class="note">Running analysis engines…</p>' : ''}</div>
+  ${tc.state === 'error' ? `<p class="err">Pipeline error: ${esc(tc.error)}</p>` : ''}</div>
+  <div id="tc-body"></div>`;
+  const body = $('#tc-body');
+  if (tc.state !== 'done') { body.innerHTML = '<div class="card"><p class="note">Pipeline still running — this page updates when it finishes.</p></div>'; return; }
+
+  // --- pipeline summary ---
+  const ran = r.ran;
+  const audit = ran['security-audit'] || {};
+  const deps = ran['deps'] || {};
+  const syms = ran['symbols'] || {};
+  const objcn = ran['objc-names'] || {};
+  const sigs = ran['signatures-scan'] || {};
+  const pkgs = ran['packages'] || {};
+  const dis = ran['disasm-auto'] || {};
+  const sigTotal = (sigs.files || []).reduce((n, f) => n + f.hits.length, 0);
+  const sevColor = { high: 'bad', medium: 'warn', low: 'note', info: 'note' };
+  body.innerHTML = `
+  <div class="card"><h3>Pipeline summary <span class="tag info">${r.durationMs} ms</span></h3>
+  <div class="grid"><div class="stat"><b>${r.counts.active}</b><span>tools ran (full)</span></div>
+  <div class="stat"><b>${r.counts.partial}</b><span>tools ran (subset)</span></div>
+  <div class="stat"><b>${r.counts.host}</b><span>need a desktop</span></div>
+  <div class="stat"><b class="${audit.score && audit.score.high ? 'err' : 'ok'}">${audit.findings ? audit.findings.length : 0}</b><span>audit findings</span></div></div>
+  <p class="note">Honest scope: 45 tools registered — ${r.counts.active + r.counts.partial} executed their core function on this file on-device; ${r.counts.host} require a Mac/PC environment and are listed with the reason (never simulated).</p></div>
+
+  <div class="card"><h3>🔗 Dependencies (otool -L across every binary)</h3>
+  <p><b>${deps.linksTotal || 0}</b> links · <span class="tag ok">system ${deps.tally && deps.tally.system || 0}</span> <span class="tag info">embedded ${deps.tally && deps.tally.embedded || 0}</span> ${deps.tally && deps.tally.missing ? `<span class="tag bad">MISSING ${deps.tally.missing}</span>` : '<span class="tag ok">no missing libraries</span>'}</p>
+  ${deps.missing && deps.missing.length ? `<p class="err">Missing (neither system nor embedded) — would crash at launch or on load:</p><div style="max-height:160px;overflow:auto">${deps.missing.map((m) => `<div style="font-family:monospace;font-size:12px;word-break:break-all">${esc(m.base)} ← ${esc(m.refs.join(', '))}</div>`).join('')}</div>` : ''}
+  ${deps.unique && deps.unique.length ? `<details><summary>All unique dependencies (${deps.unique.length})</summary><div style="max-height:240px;overflow:auto">${deps.unique.map((m) => `<div style="padding:2px 0"><span class="tag ${m.kind.startsWith('missing') ? 'bad' : m.kind.startsWith('embedded') ? 'info' : 'ok'}">${esc(m.kind)}</span> <span style="font-family:monospace;font-size:12px">${esc(m.base)}</span></div>`).join('')}</div></details>` : ''}</div>
+
+  <div class="card"><h3>℗ Symbols (nm + swift-demangle)</h3>
+  ${syms.error ? `<p class="err">${esc(syms.error)}</p>` : `<p><b>${syms.total || 0}</b> symbols across ${((syms.binaries || []).filter((b) => b.count !== undefined)).length} binaries · <span class="tag info">Swift-family ${syms.swift || 0}</span> <span class="tag info">C++ ${syms.cxx || 0}</span>${syms.truncated ? ' <span class="tag note">truncated to 60k per binary</span>' : ''}</p>
+  ${(syms.binaries || []).filter((b) => b.sample && b.sample.length).slice(0, 3).map((b) => `<details><summary>${esc(b.path)} — ${b.count} symbols (${b.arch})</summary><div style="max-height:200px;overflow:auto;font-family:monospace;font-size:12px">${b.sample.filter((x) => x.name).slice(0, 60).map((x) => `<div style="word-break:break-all;padding:1px 0">${esc(x.demangled || x.name)}${x.demangled ? ` <span class="note">← ${esc(x.name)}</span>` : ''}</div>`).join('')}</div></details>`).join('')}</div>`}
+  </div>
+
+  <div class="card"><h3>🔤 ObjC names (class-dump tables)</h3>
+  ${objcn.classes ? `<p><b>${objcn.classes}</b> classes · <b>${objcn.methods}</b> methods${objcn.truncated ? ' <span class="tag note">truncated</span>' : ''}</p>${(objcn.binaries || []).slice(0, 2).map((b) => `<details><summary>${esc(b.path)} (${b.arch})</summary><div style="max-height:200px;overflow:auto;font-family:monospace;font-size:12px">${b.sample.map((x) => `<div>${esc(x)}</div>`).join('') || '<span class="note">none</span>'}</div></details>`).join('')}` : '<p class="note">No ObjC name tables found (or binary encrypted).</p>'}</div>
+
+  <div class="card"><h3>🧭 Disassembly (Capstone 5 — real machine code)</h3>
+  ${dis.ok === false ? `<p class="err">Engine: ${esc(dis.error || 'unavailable')}</p>` : `<p class="note">${dis.binaries && dis.binaries.length ? `${dis.binaries.reduce((n, b) => n + b.instructions, 0)} instructions auto-disassembled from __text. Pick a binary below for more.` : 'No readable __text section found (binary may be FairPlay-encrypted).'}</p>`}
+  <div class="row"><select id="ds-file" style="flex:1;min-width:160px">${(ran['macho-metadata'] && ran['macho-metadata'].binaries || []).map((b, i) => `<option value="${i}">${esc(b.path)}</option>`).join('') || '<option>No Mach-O found</option>'}</select>
+  <select id="ds-n"><option value="256">256 insns</option><option value="1024">1024 insns</option><option value="4096">4096 insns</option></select>
+  <button class="btn sm" id="ds-run">Disassemble</button></div>
+  <div id="ds-out"></div></div>
+
+  <div class="card"><h3>🛡️ Security audit (MobSF-style static rules)</h3>
+  ${audit.findings ? `<div class="grid" style="margin-bottom:8px"><div class="stat"><b class="err">${audit.score.high}</b><span>high</span></div><div class="stat"><b>${audit.score.medium}</b><span>medium</span></div><div class="stat"><b>${audit.score.low}</b><span>low</span></div><div class="stat"><b>${audit.score.info}</b><span>info</span></div></div>
+  ${audit.findings.slice(0, 40).map((f) => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tag ${sevColor[f.sev]}">${f.sev}</span> <b>${esc(f.title)}</b><div class="note">${esc(f.detail)}${f.where ? ' · ' + esc(f.where) : ''}</div></div>`).join('')}${audit.findings.length > 40 ? `<p class="note">…and ${audit.findings.length - 40} more.</p>` : ''}` : '<p class="note">Audit did not run.</p>'}</div>
+
+  <div class="card"><h3>📦 Package managers</h3>
+  ${(pkgs.manifests || []).length ? pkgs.manifests.map((m) => `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="tag info">${esc(m.manager)}</span> <b>${esc(m.path)}</b>${m.count ? ` — ${m.count} entries` : ''}${m.note ? ` <span class="note">${esc(m.note)}</span>` : ''}
+  ${m.pods && m.pods.length ? `<div style="max-height:180px;overflow:auto;font-family:monospace;font-size:12px">${m.pods.map((p) => `<div>${esc(p.name)} <span class="note">${esc(p.version || '')}</span></div>`).join('')}</div>` : ''}</div>`).join('') : '<p class="note">No Podfile.lock / Cartfile.resolved / Package.resolved inside this IPA.</p>'}
+  ${pkgs.embeddedFrameworks && pkgs.embeddedFrameworks.length ? `<p class="note">Embedded frameworks: ${esc(pkgs.embeddedFrameworks.join(', '))}</p>` : ''}</div>
+
+  <div class="card"><h3>🔎 Binary signatures (binwalk scan)</h3>
+  ${sigTotal ? `<p><b>${sigTotal}</b> signatures across ${(sigs.files || []).length} files</p><details><summary>Show all</summary><div style="max-height:220px;overflow:auto;font-family:monospace;font-size:12px">${(sigs.files || []).map((f) => f.hits.map((h) => `<div>${esc(f.path)} @ 0x${h.offset.toString(16)} — ${esc(h.name)}</div>`).join('')).join('')}</div></details>` : '<p class="note">No embedded signatures found in scannable files.</p>'}</div>
+
+  <div class="card"><h3>🧰 Every tool — status on this file</h3><p class="note">Each row is the real execution record. "desktop required" rows did NOT run — the reason is stated, nothing is simulated.</p>
+  ${Object.entries(TOOLS.reduce((g, t) => { (g[t.group] ||= []).push(t); return g; }, {})).map(([group, tools]) => `<details open><summary><b>${esc(group)}</b> (${tools.length})</summary>${tools.map((t) => {
+    const rec = r.records.find((x) => x.id === t.id) || {};
+    return `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><b>${esc(t.name)}</b> ${statusChip(t)} ${toolChip(rec)} ${rec.ms !== undefined ? `<span class="tag note">${rec.ms} ms</span>` : ''}<div class="note">${esc(rec.summary && rec.summary !== 'subset ran' ? rec.summary : t.detail)}</div></div>`;
+  }).join('')}</details>`).join('')}</div>`;
+  bindDisasm(v);
+}
+async function bindDisasm(v) {
+  const btn = $('#ds-run'); if (!btn) return;
+  btn.onclick = async () => {
+    const s = cur(); const i = parseInt($('#ds-file').value, 10); const n = parseInt($('#ds-n').value, 10);
+    const out = $('#ds-out'); const recs = (s.tc.result.ran['macho-metadata'] && s.tc.result.ran['macho-metadata'].binaries) || [];
+    const b = recs[i]; if (!b) { out.innerHTML = '<p class="note">Pick a binary first.</p>'; return; }
+    out.innerHTML = '<p class="note">Loading Capstone engine and disassembling…</p>';
+    try {
+      const rec = s.model.files.find((f) => f.path === b.path);
+      const { bytes } = await readRecBytes(s.file, rec, Math.min(rec.size, 64 << 20));
+      const m = parseMachO(bytes);
+      const sl = m.slices.find((x) => x.ok); if (!sl) throw new Error('No readable slice');
+      const text = (sl.sections || []).find((x) => x.sect === '__text' && x.seg === '__TEXT');
+      if (!text) throw new Error('No __text section');
+      const seg = (sl.segments || []).find((x) => x.name === '__TEXT');
+      const vmaddr = seg ? seg.vmaddr + (text.offset - seg.fileoff) : text.offset;
+      const r = await disasm(bytes.subarray(text.offset, Math.min(text.offset + Math.min(text.size, DISASM_LIMITS.maxBytesPerRun), bytes.length)), sl.arch, vmaddr, { count: n });
+      out.innerHTML = `<p class="note">${r.instructions.length} instructions from __text @ vmaddr 0x${vmaddr.toString(16)} (${esc(sl.arch)})</p><div style="max-height:340px;overflow:auto;font-family:monospace;font-size:11px">${r.instructions.map((x) => `<div>0x${x.address.toString(16).padStart(8, '0')}  ${esc(x.bytes)}  ${esc(x.mnemonic.padEnd(8))} ${esc(x.op)}</div>`).join('')}</div>`;
+    } catch (e) { out.innerHTML = `<p class="err">Disassembly failed: ${esc(e.message)}</p>`; }
+  };
 }
 
 // ---------- settings ----------

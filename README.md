@@ -21,6 +21,33 @@ is a dependency-free browser app; this repo wraps it in a native iOS shell
 | `docs/BUILD_FROM_IPHONE.md` | How to run the build and get the IPA, from an iPhone |
 | `docs/DECISIONS.md` | Every engineering decision, with reasons |
 
+## Toolchain — 45-tool analysis workspace
+
+Opening an IPA automatically runs the full compatible analysis pipeline and
+populates the **Toolchain** tab with real, on-device results:
+
+- **Mach-O engine** (otool/MachOView/LIEF class): load commands, segments,
+  sections, UUID, platform, FairPlay status for every binary.
+- **Symbol engine** (nm): the full `LC_SYMTAB` walk with classification.
+- **Demangler** (swift-demangle subset + LLVM-style C++): `_Tt` ObjC-bridged
+  Swift types, `_$s` paths (best-effort), Itanium nested names.
+- **Dependency engine** (otool -L / Dependency Walker): every link in every
+  binary classified **system / embedded / MISSING**.
+- **ObjC names** (class-dump class): classes, methods, method types, strings.
+- **Disassembly** (Capstone 5, vendored WASM, BSD): genuine ARM64/ARM/Thumb/
+  x86/x86_64 disassembly, auto-sample plus interactive per-binary runs.
+- **Signature scanner** (binwalk): magic scan of every readable file.
+- **Package managers**: Podfile.lock / Cartfile.resolved / Package.resolved.
+- **Security audit** (MobSF-style iOS static rules): ATS, permissions,
+  entitlements (get-task-allow), PIE/ARC/canary, dangerous C APIs,
+  secret-pattern scan (false positives are labelled as such).
+
+Every one of the 45 requested tools has a registry entry with an honest
+status: `active` (core function ran on this file), `partial` (stated subset
+ran) or `desktop` (genuinely cannot run inside an iOS app — reason given,
+never simulated). The per-file execution record (status, duration, counts)
+is shown in the Toolchain tab.
+
 ## Quick start (maintainer)
 
 ```
