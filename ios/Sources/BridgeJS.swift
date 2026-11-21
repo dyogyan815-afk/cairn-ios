@@ -33,20 +33,38 @@ enum BridgeJS {
           if (!(blob instanceof Blob)) return false;
           var total = blob.size;
           var chunkBytes = (opts && opts.chunkBytes) || CHUNK;
-          var acked = -1, waiter = null;
+          var acked = -1, waiter = null, nativeFail = null;
           var onAck = function (ev) {
             var d = (ev && ev.detail) || {};
             if (String(d.name) === NAME) {
               acked = Math.max(acked, d.index | 0);
-              if (waiter) { var w = waiter; waiter = null; w(); }
+              // resolve(true): the waiter resolves the waitAck promise — calling
+              // it with NO argument resolved to undefined (falsy) and even a
+              // successful ACK was treated as "did not confirm chunk N".
+              if (waiter) { var w = waiter; waiter = null; w(true); }
+            }
+          };
+          // If the native app reports a failure while we are waiting for an ack,
+          // resolve the waiter immediately with the real reason (no 15 s dead wait).
+          var onFail = function (ev) {
+            var d = (ev && ev.detail) || {};
+            if (String(d.name) === NAME && !nativeFail) {
+              nativeFail = String(d.message || 'save failed');
+              if (waiter) { var w = waiter; waiter = null; w(false); }
             }
           };
           window.addEventListener('cairnsaveack', onAck);
+          window.addEventListener('cairnsavefail', onFail);
           var waitAck = function (index) {
             return new Promise(function (resolve) {
+              // A native failure may have arrived before we started waiting
+              // (it is dispatched synchronously with the message on the mock
+              // and can race the microtask in the app) — never wait 15 s for it.
+              if (nativeFail) { resolve(false); return; }
               if (acked >= index) { resolve(true); return; }
               waiter = resolve;
-              setTimeout(function () { if (waiter === resolve) { waiter = null; resolve(false); } }, 15000);
+              var t = setTimeout(function () { if (waiter === resolve) { waiter = null; resolve(false); } }, 15000);
+              if (t && typeof t.unref === 'function') { t.unref(); } // don't pin the page/test-runner to a settled wait
             });
           };
           try {
@@ -55,9 +73,17 @@ enum BridgeJS {
             while (off < total) {
               var end = Math.min(off + chunkBytes, total);
               var buf = await blob.slice(off, end).arrayBuffer();
-              mh.postMessage({ kind: 'chunk', index: idx, data: b64(buf) });
+              // NOTE: every message carries the file name — the native side keys
+              // its sessions by name, and a chunk without one used to be looked
+              // up under the default ("export.zip"), failing every transfer
+              // ("No active session for export.zip").
+              mh.postMessage({ kind: 'chunk', name: NAME, index: idx, data: b64(buf) });
               var ok = await waitAck(idx);
-              if (!ok) throw new Error('the app did not confirm chunk ' + idx + ' — transfer stopped');
+              if (!ok) {
+                throw new Error(nativeFail
+                  ? ('the app reported: ' + nativeFail)
+                  : ('the app did not confirm chunk ' + idx + ' — transfer stopped'));
+              }
               off = end; idx++;
               if (onProgress) { try { onProgress(off, total); } catch (e) {} }
               if (total > 0) {
@@ -69,18 +95,25 @@ enum BridgeJS {
               }
             }
             if (total === 0) {
-              mh.postMessage({ kind: 'chunk', index: 0, data: '' });
+              mh.postMessage({ kind: 'chunk', name: NAME, index: 0, data: '' });
               var ok0 = await waitAck(0);
-              if (!ok0) throw new Error('the app did not confirm the empty file');
+              if (!ok0) {
+                throw new Error(nativeFail
+                  ? ('the app reported: ' + nativeFail)
+                  : 'the app did not confirm the empty file');
+              }
             }
             mh.postMessage({ kind: 'finish', name: NAME });
             return true;
           } finally {
             window.removeEventListener('cairnsaveack', onAck);
+            window.removeEventListener('cairnsavefail', onFail);
           }
         } catch (e) {
           var msg = String(e && e.message || e);
-          try { window.dispatchEvent(new CustomEvent('cairnsavefail', { detail: { name: NAME, message: msg } })); } catch (e2) {}
+          // Native may have already shown the reason (cairnsavefail) — avoid a
+          // second, less precise toast for the same failure.
+          try { if (!nativeFail) window.dispatchEvent(new CustomEvent('cairnsavefail', { detail: { name: NAME, message: msg } })); } catch (e2) {}
           try { mh.postMessage({ kind: 'abort', name: NAME, error: msg }); } catch (e3) {}
           return false;
         }

@@ -90,9 +90,12 @@ final class SaveBridge: NSObject, WKScriptMessageHandler {
     private let lock = NSLock()
     private var sessions: [String: ExportSession] = [:]
     private weak var webView: WKWebView?
+    /// Where ExportSession writes its files. Nil = the default Documents/Exports.
+    private let sessionDir: URL?
 
-    init(webView: WKWebView? = nil) {
+    init(webView: WKWebView? = nil, sessionDir: URL? = nil) {
         self.webView = webView
+        self.sessionDir = sessionDir
         super.init()
     }
 
@@ -104,6 +107,12 @@ final class SaveBridge: NSObject, WKScriptMessageHandler {
                                didReceive message: WKScriptMessage) {
         guard message.name == SaveBridge.messageHandlerName else { return }
         guard let body = message.body as? [String: Any] else { return }
+        handle(body)
+    }
+
+    /// Message dispatch, separated from WKScriptMessage so unit tests can drive
+    /// the exact protocol the injected JS speaks (begin → chunk* → finish | abort).
+    func handle(_ body: [String: Any]) {
         let kind = body["kind"] as? String ?? ""
         let name = (body["name"] as? String) ?? "export.zip"
         lock.lock()
@@ -111,7 +120,12 @@ final class SaveBridge: NSObject, WKScriptMessageHandler {
         switch kind {
         case "begin":
             let size = (body["size"] as? NSNumber)?.int64Value ?? 0
-            let session = ExportSession(name: name, expectedSize: size)
+            // A retry with the same file name replaces the stale attempt (and
+            // closes/deletes its half-written temp file) instead of leaking it.
+            if let stale = sessions[name] {
+                stale.abort()
+            }
+            let session = ExportSession(name: name, expectedSize: size, tmpDir: sessionDir)
             do {
                 try session.begin()
                 sessions[name] = session
@@ -119,18 +133,30 @@ final class SaveBridge: NSObject, WKScriptMessageHandler {
                 reportFailure(name, error)
             }
         case "chunk":
-            guard let session = sessions[name] else {
-                reportFailure(name, ExportSession.ExportError(message: "No active session for \(name)"))
+            // Older injected JS sent chunks WITHOUT a name; they used to be
+            // looked up under the "export.zip" default and every transfer failed
+            // with "No active session". If the name is missing but exactly one
+            // session is active, address that session; otherwise report clearly.
+            let target: String
+            if body["name"] is String {
+                target = name
+            } else if sessions.count == 1, let only = sessions.keys.first {
+                target = only
+            } else {
+                target = name
+            }
+            guard let session = sessions[target] else {
+                reportFailure(target, ExportSession.ExportError(message: "No active session for \(target)"))
                 break
             }
             if let chunk = body["data"] as? String {
                 do {
                     try session.append(base64: chunk)
-                    ackChunk(name: name, index: (body["index"] as? NSNumber)?.intValue ?? -1, received: session.received)
+                    ackChunk(name: target, index: (body["index"] as? NSNumber)?.intValue ?? -1, received: session.received)
                 } catch {
-                    sessions.removeValue(forKey: name)
+                    sessions.removeValue(forKey: target)
                     session.abort()
-                    reportFailure(name, error)
+                    reportFailure(target, error)
                 }
             }
         case "finish":

@@ -6,7 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "1.2.1"
+    MARKETING_VERSION: "1.2.2"
     CURRENT_PROJECT_VERSION: "2"
     # Bundle ID is defined in exactly ONE documented place: here.
     # Change it here before re-signing with your own certificate.
@@ -35,8 +35,8 @@ targets:
         CFBundleName: Cairn
         # Versions are written LITERALLY here (xcodegen ignores the
         # MARKETING_VERSION build setting when generating the plist).
-        CFBundleShortVersionString: "1.2.1"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "1.2.2"
+        CFBundleVersion: "5"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

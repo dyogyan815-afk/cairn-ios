@@ -18,7 +18,12 @@ function toast(m) { const t = $('#toast'); t.textContent = m; t.classList.add('o
 const cur = () => S.cur;
 // Native app reports where an export landed (and if a save failed) — show it once.
 if (typeof window.addEventListener === 'function') {
-  window.addEventListener('cairnsaveok', (e) => toast(`📁 Saved in phone: Files app → On My iPhone → Cairn → ${e.detail?.file || 'Exports'}`));
+  window.addEventListener('cairnsaveok', (e) => {
+    toast(`📁 Saved in phone: Files app → On My iPhone → Cairn → ${e.detail?.file || 'Exports'}`);
+    // Refresh the "Phone files" card if it is on screen (reuses its Refresh path).
+    const rf = document.getElementById('pf-refresh');
+    if (rf && window.__cairnFiles) rf.click();
+  });
   window.addEventListener('cairnsavefail', (e) => toast(`⚠ Save failed: ${e.detail?.message || 'unknown error'}`));
   window.addEventListener('cairnsaveprogress', (e) => toast(`📲 Saving to phone: ${e.detail?.pct ?? 0}% …`));
 }

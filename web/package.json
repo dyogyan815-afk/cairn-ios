@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.mjs",
     "build": "node scripts/build.mjs",
-    "test": "node --test --test-concurrency=1 tests/engine.test.mjs tests/objcnames.test.mjs"
+    "test": "node --test --test-concurrency=1 tests/engine.test.mjs tests/objcnames.test.mjs tests/bridge.test.mjs"
   },
   "engines": { "node": ">=20" }
 }
