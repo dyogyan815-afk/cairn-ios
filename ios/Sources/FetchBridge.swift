@@ -121,7 +121,9 @@ final class CappedDownload: NSObject, URLSessionDataDelegate {
                     didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         self.response = response as? HTTPURLResponse
-        if let expected = response.expectedContentLength, expected > Int64(cap) {
+        // expectedContentLength is Int64 (-1 when unknown) — reject oversized
+        // responses up front so nothing beyond the cap is ever accepted.
+        if response.expectedContentLength > Int64(cap) {
             finish(.failure(CappedDownload.FetchError(message: "response is larger than the \(cap / (1 << 20)) MB limit")))
             completionHandler(.cancel)
             return
